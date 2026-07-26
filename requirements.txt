@@ -1,0 +1,13 @@
+# Core dependencies
+numpy
+matplotlib
+scipy
+lvpyio
+
+# GPU array backend -- pick ONE based on your CUDA Toolkit version, then
+# uncomment it (or install manually, see README):
+# cupy-cuda11x   # CUDA Toolkit 11.2 - 11.8
+# cupy-cuda12x   # CUDA Toolkit 12.x
+
+# openpiv-python-gpu is NOT on PyPI and is not installed by this file.
+# Clone it and add it to your PYTHONPATH -- see README "Installation".

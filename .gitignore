@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+stereo_piv_output/
+cam0_raw/
+cam1_raw/
