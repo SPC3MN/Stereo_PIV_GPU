@@ -13,7 +13,20 @@ dewarped pair, then combines the two in-plane displacement fields into
 Requires: pip install lvpyio   (LaVision's official reader, cross-platform,
 pure pip install -- no DaVis license or C++ build tools needed to read data)
 
-INPUT_MODE options (set in CONTROLS):
+CONFIG FILE
+-----------
+Every setting below (formerly the CONTROLS class) now lives in a JSON file
+-- CONFIG_PATH, default "stereo_piv_config.json" next to this script (or
+pass a different path as argv[1]: `python Stereo-PIV.py my_config.json`).
+If that file doesn't exist yet, load_controls() writes one out populated
+with DEFAULT_CONFIG's values and proceeds using them -- so a first run
+works out of the box, and after that you just edit the JSON (calibration
+coefficients, input_path, piv_settings, etc.) and re-run; no need to touch
+this .py file for day-to-day tuning. You only need to include the keys
+you're actually changing -- anything missing from the file falls back to
+DEFAULT_CONFIG.
+
+INPUT_MODE options (set in the config file):
   "set"   -- point at a DaVis stereo image set (a folder or a .set file,
              still inside its original project structure). lvpyio iterates
              the buffers directly in native LaVision-container order; each
@@ -29,30 +42,37 @@ INPUT_MODE options (set in CONTROLS):
 
 WHAT'S REAL VS. A PLACEHOLDER RIGHT NOW
 ----------------------------------------
-- CAM0_MAPPING below is built from your actual "Plane 1" calibration report
-  coefficients -- verified: world_to_raw() reproduces the same numbers
-  computed by hand from your screenshot.
-- CAM1_MAPPING is a PLACEHOLDER (clearly marked below) so the pipeline is
-  exercisable end-to-end. Replace it with camera 2's ("Plane 2") actual
-  coefficients from the same DaVis report panel before trusting any output.
-- ANGLE1/ANGLE2 (alpha/beta, used only in the final combination step) are
-  also placeholders. This single-Z-plane calibration doesn't carry Z
-  sensitivity on its own -- that has to come from either (a) DaVis's
-  reported per-camera viewing angle to the sheet normal specifically (not
-  necessarily the "Min/max angle 1-2" figure, which reads like the angle
-  BETWEEN the two cameras rather than either one's angle to the normal --
-  worth confirming which it is), or (b) a second calibration at a different
-  Z, differenced numerically the same way as the polynomial terms here.
-  Don't trust W (or U/V, which also depend on these angles) until this is
-  pinned down.
-- STEREO_FRAME_ORDER (in CONTROLS) is an ASSUMPTION about how DaVis
-  interleaves the two cameras' frames within one combined buffer/file --
-  "camera_major" ([cam0_A, cam0_B, cam1_A, cam1_B]) is the default guess.
-  If CAM0_MAPPING visibly dewarps the wrong camera's image (garbled/black
-  output), flip it to "frame_major" ([cam0_A, cam1_A, cam0_B, cam1_B]) --
-  see frames_from_stereo_buffer() below. Only relevant when a single
-  buffer/file actually holds all 4 exposures; the "loose" separate-file
-  case sidesteps this entirely since each camera's pair is its own file.
+- cam0_mapping in the config file is built from your actual "Plane 1"
+  calibration report coefficients -- verified: world_to_raw() reproduces
+  the same numbers computed by hand from your screenshot.
+- cam1_mapping is a PLACEHOLDER (clearly marked in DEFAULT_CONFIG below)
+  so the pipeline is exercisable end-to-end. Replace it with camera 2's
+  ("Plane 2") actual coefficients from the same DaVis report panel, in
+  the config file, before trusting any output.
+- alpha1_deg/alpha2_deg/beta1_deg/beta2_deg (used only in the final
+  combination step) are also placeholders. This single-Z-plane
+  calibration doesn't carry Z sensitivity on its own -- that has to come
+  from either (a) DaVis's reported per-camera viewing angle to the sheet
+  normal specifically (not necessarily the "Min/max angle 1-2" figure,
+  which reads like the angle BETWEEN the two cameras rather than either
+  one's angle to the normal -- worth confirming which it is), or (b) a
+  second calibration at a different Z, differenced numerically the same
+  way as the polynomial terms here. Don't trust W (or U/V, which also
+  depend on these angles) until this is pinned down.
+- stereo_frame_order (in the config file) is an ASSUMPTION about how
+  DaVis interleaves the two cameras' frames within one combined
+  buffer/file -- "camera_major" ([cam0_A, cam0_B, cam1_A, cam1_B]) is the
+  default guess. If cam0_mapping visibly dewarps the wrong camera's image
+  (garbled/black output), flip it to "frame_major"
+  ([cam0_A, cam1_A, cam0_B, cam1_B]) -- see frames_from_stereo_buffer()
+  below. Only relevant when a single buffer/file actually holds all 4
+  exposures; the "loose" separate-file case sidesteps this entirely since
+  each camera's pair is its own file.
+- piv_settings.search_size_iters (in the config file) is a best-effort
+  translation of the pipeline's original multi-pass intent into the
+  actual piv_gpu API's tuple-per-pass format -- see the PIV WINDOW
+  SETTINGS note in DEFAULT_CONFIG below before trusting the vector field's
+  spatial resolution/convergence.
 
 PERFORMANCE NOTE
 -----------------
@@ -78,19 +98,22 @@ few GB VRAM, especially if it's also driving a display or shared with
 DaVis) this tradeoff is worth it; if VRAM isn't tight, build process0/
 process1 once in main() (as the planar pipeline does with a single
 process) and reuse them pair to pair instead. The other big lever if
-VRAM is still too tight is CONTROLS.piv_kwargs itself: raising
-min_search_size and/or lowering overlap_ratio shrinks the number of
-simultaneous correlation windows (at the cost of vector spatial
-resolution), which usually matters far more than the sequential-camera
-change above.
+VRAM is still too tight is piv_settings in the config file: lowering
+overlap_ratio shrinks the number of simultaneous correlation windows (at
+the cost of vector spatial resolution) -- this matters far more than
+min_search_size does, since (for a fixed overlap_ratio) the correlation
+buffer memory is roughly invariant to window size: n_windows scales as
+1/step**2 while each window's padded FFT buffer scales as window_size**2,
+and step = window_size*(1-overlap_ratio), so those cancel except for the
+overlap_ratio term.
 """
 
 import os
 import sys
+import json
 import glob
 import csv
 import time
-import inspect
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
@@ -157,90 +180,104 @@ class CameraMapping:
                                 order=order, mode="constant", cval=0.0)
 
 
-# --- Camera 0 ("Plane 1"): your actual calibration report coefficients ---
-CAM0_MAPPING = CameraMapping(
-    x0=2806.99, x_span=4096.00, y0=1387.18, y_span=3008.00,
-    dx_coefs=dict(**{'1': 804.1028, 's': 628.9870, 's2': 84.0572, 's3': -5.4234,
-                      't': 3.1818, 't2': -0.3017, 't3': 0.2112,
-                      'st': 0.6693, 's2t': -0.1956, 't2s': -0.4162}),
-    dy_coefs=dict(**{'1': 28.8679, 's': 3.4689, 's2': -0.0086, 's3': -0.0561,
-                      't': -1.2230, 't2': 1.3855, 't3': -0.9813,
-                      'st': 89.0937, 's2t': -5.3036, 't2s': -0.2961}),
-    name="cam0",
-)
-
-# --- Camera 1 ("Plane 2"): PLACEHOLDER -- replace with the real coefficients ---
-CAM1_MAPPING = CameraMapping(
-    x0=2806.99, x_span=4096.00, y0=1387.18, y_span=3008.00,
-    dx_coefs=dict(**{'1': -780.0, 's': -610.0, 's2': 80.0, 's3': 5.0,
-                      't': -3.0, 't2': 0.3, 't3': -0.2,
-                      'st': -0.6, 's2t': 0.2, 't2s': 0.4}),
-    dy_coefs=dict(**{'1': 30.0, 's': -3.2, 's2': 0.01, 's3': 0.05,
-                      't': 1.3, 't2': -1.4, 't3': 0.98,
-                      'st': -88.0, 's2t': 5.0, 't2s': 0.3}),
-    name="cam1 (PLACEHOLDER -- not your real data)",
-)
-
-
 # ======================================================================
-# CONTROLS
+# Config -- all pipeline settings, defaulted here and overridable via a
+# JSON file (see load_controls() and the CONFIG FILE note in the module
+# docstring above)
 # ======================================================================
-class CONTROLS:
+CONFIG_PATH = "stereo_piv_config.json"
+
+DEFAULT_CONFIG = {
     # ---------------- Input source ----------------
-    input_mode = "set"                     # "set" or "loose"
-    input_path = "D:\\messy_data\\Stereo\\6-12_5.set"   # .set file / set folder / plain folder
+    "input_mode": "set",                     # "set" or "loose"
+    "input_path": "D:\\messy_data\\Stereo\\6-12_5.set",  # .set file / set folder / plain folder
 
     # Only used for input_mode == "set", if that path turns out to be a
     # DaVis multi-set. Which sub-set to process; 0 is usually camera 1 --
     # but for a proper stereo set both cameras live in the SAME sub-set's
-    # buffers (see STEREO_FRAME_ORDER), so this is rarely needed here.
-    multiset_index = 0
+    # buffers (see stereo_frame_order), so this is rarely needed here.
+    "multiset_index": 0,
 
     # How the 4 frames in a combined stereo buffer/file are ordered (see
-    # the "STEREO_FRAME_ORDER" note in the module docstring above). Only
-    # matters when a single buffer/file holds all 4 exposures.
+    # the module docstring above). Only matters when a single buffer/file
+    # holds all 4 exposures.
     # "camera_major": [cam0_A, cam0_B, cam1_A, cam1_B]
     # "frame_major":  [cam0_A, cam1_A, cam0_B, cam1_B]
-    stereo_frame_order = "camera_major"
+    "stereo_frame_order": "camera_major",
 
     # Only used for input_mode == "loose" when the two cameras turn out to
     # be SEPARATE double-frame files rather than one combined 4-frame file
     # (auto-detected from the first file). "cam1"/"cam2" here follows
     # DaVis's own (1-indexed) camera naming; they map to cam0_mapping /
     # cam1_mapping below. Adjust to match your actual naming convention.
-    suffix_cam0 = "_cam1.im7"
-    suffix_cam1 = "_cam2.im7"
-    loose_glob = "*.im7"                   # glob used to find files in "loose" mode
+    "suffix_cam0": "_cam1.im7",
+    "suffix_cam1": "_cam2.im7",
+    "loose_glob": "*.im7",                   # glob used to find files in "loose" mode
 
     # ---------------- Calibration mappings ----------
-    cam0_mapping = CAM0_MAPPING
-    cam1_mapping = CAM1_MAPPING
+    # cam0_mapping: your actual "Plane 1" calibration report coefficients.
+    # cam1_mapping: PLACEHOLDER -- replace with camera 2's ("Plane 2")
+    # actual coefficients from the same DaVis report panel before trusting
+    # any output. Fields match CameraMapping.__init__ above exactly.
+    "cam0_mapping": {
+        "x0": 2806.99, "x_span": 4096.00, "y0": 1387.18, "y_span": 3008.00,
+        "dx_coefs": {"1": 804.1028, "s": 628.9870, "s2": 84.0572, "s3": -5.4234,
+                     "t": 3.1818, "t2": -0.3017, "t3": 0.2112,
+                     "st": 0.6693, "s2t": -0.1956, "t2s": -0.4162},
+        "dy_coefs": {"1": 28.8679, "s": 3.4689, "s2": -0.0086, "s3": -0.0561,
+                     "t": -1.2230, "t2": 1.3855, "t3": -0.9813,
+                     "st": 89.0937, "s2t": -5.3036, "t2s": -0.2961},
+        "name": "cam0",
+    },
+    "cam1_mapping": {
+        "x0": 2806.99, "x_span": 4096.00, "y0": 1387.18, "y_span": 3008.00,
+        "dx_coefs": {"1": -780.0, "s": -610.0, "s2": 80.0, "s3": 5.0,
+                     "t": -3.0, "t2": 0.3, "t3": -0.2,
+                     "st": -0.6, "s2t": 0.2, "t2s": 0.4},
+        "dy_coefs": {"1": 30.0, "s": -3.2, "s2": 0.01, "s3": 0.05,
+                     "t": 1.3, "t2": -1.4, "t3": 0.98,
+                     "st": -88.0, "s2t": 5.0, "t2s": 0.3},
+        "name": "cam1 (PLACEHOLDER -- not your real data)",
+    },
 
     # World/dewarped output grid, from DaVis's calibration report
     # ("Size of dewarped image" / "Scale factor"). (rows, cols).
-    world_shape = (3067, 5874)
-    world_scale_px_per_mm = 17.92
-    dewarp_order = 1              # interpolation order for the warp (1=bilinear)
+    "world_shape": (3067, 5874),
+    "world_scale_px_per_mm": 17.92,
+    "dewarp_order": 1,             # interpolation order for the warp (1=bilinear)
 
     # ---------------- Output ----------------
-    output_dir = "stereo_piv_output"
+    "output_dir": "stereo_piv_output",
 
     # ---------------- PIV window size / passes / core settings ----------
-    # Forwarded to piv_gpu(frame_shape, **piv_kwargs); unsupported kwargs
-    # are dropped with a warning -- see filter_supported_kwargs().
-    piv_kwargs = dict(
-        min_search_size=32,
-        search_size_iters=3,
-        overlap_ratio=0.5,
-        dt=1.0,
-        validation_method="mean_velocity",
-    )
+    # piv_gpu.__init__(frame_shape, min_search_size, **kwargs) -- so
+    # min_search_size is kept separate here (it's a required positional
+    # arg, not part of piv_settings/**kwargs). piv_settings is forwarded
+    # as piv_gpu(frame_shape, min_search_size, **piv_settings);
+    # unrecognized keys are only WARNED about, never dropped -- see
+    # check_piv_settings() (piv_gpu itself ignores unknown kwargs safely).
+    #
+    # search_size_iters is a TUPLE, one entry per multi-pass resolution
+    # level -- its length sets the number of passes (window size doubles
+    # per level going up from min_search_size), and each entry is the
+    # number of deformation iterations to run at that pass's window size.
+    # [1, 1, 1] here is a best-effort translation of the pipeline's
+    # original intent (3 passes, refining down to min_search_size=32) into
+    # this tuple format -- confirm the exact per-element semantics against
+    # openpiv_gpu's own PIVGPU docs/source if precise convergence behavior
+    # matters for your data.
+    "min_search_size": 32,
+    "piv_settings": {
+        "search_size_iters": [1, 1, 1],
+        "overlap_ratio": 0.5,
+        "dt": 1.0,
+    },
 
     # ---------------- Per-camera post-processing (before combining) -------
-    global_outlier_std = None
-    replace_invalid = True
-    smooth_field = False
-    smooth_sigma = 1.0
+    "global_outlier_std": None,
+    "replace_invalid": True,
+    "smooth_field": False,
+    "smooth_sigma": 1.0,
 
     # ---------------- Stereo geometry ----------------
     # Rig: each camera tilted 45 deg from the calibration plate normal,
@@ -256,24 +293,59 @@ class CONTROLS:
     # reconstructed W, so if W comes out inverted relative to a known
     # reference (e.g. mean flow direction, or DaVis's own W sign
     # convention), swap alpha1_deg/alpha2_deg.
-    alpha1_deg = -89.53 / 2   # -44.765
-    alpha2_deg = 89.53 / 2    # +44.765
-    beta1_deg = 0.0
-    beta2_deg = 0.0
+    "alpha1_deg": -89.53 / 2,   # -44.765
+    "alpha2_deg": 89.53 / 2,    # +44.765
+    "beta1_deg": 0.0,
+    "beta2_deg": 0.0,
 
     # ---------------- Units ----------------
-    frame_dt_s = None            # s between frames; None keeps displacement units
-    apply_v_sign_flip = True
+    "frame_dt_s": None,            # s between frames; None keeps displacement units
+    "apply_v_sign_flip": True,
 
     # ---------------- Output artifacts ----------------
-    save_npz = True
-    save_plot = True
-    save_summary_csv = True
-    plot_dpi = 150
-    quiver_scale = 1000
-    show_plots = False
+    "save_npz": True,
+    "save_plot": True,
+    "save_summary_csv": True,
+    "plot_dpi": 150,
+    "quiver_scale": 1000,
+    "show_plots": False,
 
-    verbose = True
+    "verbose": True,
+}
+
+
+class CONTROLS:
+    """Populated at runtime by load_controls() -- see DEFAULT_CONFIG and
+    the CONFIG FILE note in the module docstring above."""
+    pass
+
+
+def load_controls(config_path):
+    """Load pipeline settings from a JSON config file, creating one
+    (populated with DEFAULT_CONFIG) if it doesn't exist yet, then apply
+    the merged result onto CONTROLS. Keys present in the file override
+    DEFAULT_CONFIG's; anything the file doesn't mention falls back to the
+    default -- you only need to include the settings you're changing."""
+    config = dict(DEFAULT_CONFIG)
+    if os.path.exists(config_path):
+        with open(config_path) as f:
+            user_config = json.load(f)
+        config.update(user_config)
+        print(f"[info] loaded config from '{config_path}'")
+    else:
+        with open(config_path, "w") as f:
+            json.dump(DEFAULT_CONFIG, f, indent=2)
+        print(f"[info] '{config_path}' didn't exist -- wrote defaults there. "
+              "Edit it (calibration coefficients, input_path, etc.) and "
+              "re-run to customize.")
+
+    for key, val in config.items():
+        setattr(CONTROLS, key, val)
+
+    CONTROLS.world_shape = tuple(CONTROLS.world_shape)
+    CONTROLS.cam0_mapping = CameraMapping(**config["cam0_mapping"])
+    CONTROLS.cam1_mapping = CameraMapping(**config["cam1_mapping"])
+    return CONTROLS
 
 
 # ======================================================================
@@ -362,8 +434,8 @@ def iter_stereo_from_loose_files(ctrl):
         if not files0:
             sys.exit(
                 f"Files aren't combined 4-frame stereo buffers but none end "
-                f"in '{ctrl.suffix_cam0}' -- set CONTROLS.suffix_cam0/"
-                "suffix_cam1 to match your naming"
+                f"in '{ctrl.suffix_cam0}' -- set suffix_cam0/suffix_cam1 in "
+                "the config file to match your naming"
             )
         for path0 in files0:
             path1 = path0[: -len(ctrl.suffix_cam0)] + ctrl.suffix_cam1
@@ -380,20 +452,31 @@ def iter_stereo_from_loose_files(ctrl):
 # ======================================================================
 # Shared PIV / post-processing helpers (same logic as the planar pipeline)
 # ======================================================================
-def filter_supported_kwargs(func, kwargs):
-    sig = inspect.signature(func)
-    accepted, dropped = {}, []
-    for key, val in kwargs.items():
-        if val is None:
-            continue
-        if key in sig.parameters:
-            accepted[key] = val
-        else:
-            dropped.append(key)
-    if dropped:
-        print(f"[info] piv_gpu does not accept {dropped} -- dropped "
-              f"(edit CONTROLS.piv_kwargs to match your installed version)")
-    return accepted
+# The real keyword names piv_gpu.__init__(frame_shape, min_search_size,
+# **kwargs) accepts -- min_search_size itself is a separate required
+# positional arg, NOT one of these. piv_gpu already ignores unrecognized
+# kwargs safely (each one is read via `kwargs["x"] if "x" in kwargs else
+# DEFAULT`, never strict signature binding), so this set exists only to
+# WARN about likely typos in piv_settings, not to filter/drop anything --
+# unlike the old inspect.signature-based approach, which was actively
+# wrong here (it matched against **kwargs's own parameter name, not the
+# individual setting names it swallows, so it dropped everything real).
+PIV_GPU_SETTINGS_KEYS = frozenset({
+    "search_size_iters", "overlap_ratio", "shrink_ratio", "center",
+    "normalize", "mask_zero", "subpixel_method", "n_fft", "deforming_par",
+    "batch_size", "s2n_method", "s2n_size", "validation_size", "s2n_tol",
+    "median_tol", "mad_tol", "mean_tol", "rms_tol", "num_replacing_iters",
+    "replacing_method", "replacing_size", "revalidate", "smooth",
+    "smoothing_par", "dt", "scaling_par", "mask", "dtype_f",
+})
+
+
+def check_piv_settings(piv_settings):
+    unknown = sorted(set(piv_settings) - PIV_GPU_SETTINGS_KEYS)
+    if unknown:
+        print(f"[warn] piv_settings has keys piv_gpu won't recognize: "
+              f"{unknown} -- check spelling against piv_gpu's __init__ "
+              "kwargs (they're silently ignored, not an error)")
 
 
 def global_outlier_mask(u, v, n_std):
@@ -511,8 +594,8 @@ def process_camera(process, frame_a, frame_b, ctrl):
 
 
 def init_processor(frame_shape, ctrl):
-    piv_kwargs = filter_supported_kwargs(piv_gpu.__init__, ctrl.piv_kwargs)
-    process = piv_gpu(frame_shape, **piv_kwargs)
+    check_piv_settings(ctrl.piv_settings)
+    process = piv_gpu(frame_shape, ctrl.min_search_size, **ctrl.piv_settings)
     x, y = process.coords
     y = frame_shape[0] * process.scaling_par - y
     return process, x, y
@@ -580,7 +663,8 @@ def handle_pair(pair_id, dw_a0, dw_b0, dw_a1, dw_b1, ctrl, angles):
 # Main
 # ======================================================================
 def main():
-    ctrl = CONTROLS
+    config_path = sys.argv[1] if len(sys.argv) > 1 else CONFIG_PATH
+    ctrl = load_controls(config_path)
     os.makedirs(ctrl.output_dir, exist_ok=True)
 
     if ctrl.input_mode == "set":

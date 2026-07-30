@@ -12,9 +12,9 @@ displacement fields into 3-component (U, V, W) stereo velocity.
 
 ## ⚠️ Before trusting any output
 
-- **`CAM1_MAPPING` in `Stereo-PIV.py` is a placeholder.** Only `CAM0_MAPPING`
+- **`cam1_mapping` in the config file is a placeholder.** Only `cam0_mapping`
   ("Plane 1") is built from real calibration report coefficients. Replace
-  `CAM1_MAPPING` with camera 2's ("Plane 2") actual coefficients from the
+  `cam1_mapping` with camera 2's ("Plane 2") actual coefficients from the
   same DaVis report panel before trusting any output.
 - **`alpha1_deg`/`alpha2_deg` (and `beta1_deg`/`beta2_deg`) are placeholders
   too.** This single-Z-plane calibration doesn't carry Z sensitivity on its
@@ -32,10 +32,17 @@ displacement fields into 3-component (U, V, W) stereo velocity.
 - **`stereo_frame_order` is an assumption, not a verified fact.** A combined
   stereo buffer's 4 frames (2 cameras x 2 frames) are read in
   `"camera_major"` order (`[cam0_A, cam0_B, cam1_A, cam1_B]`) by default.
-  If `CAM0_MAPPING` visibly dewarps the wrong camera's raw image
+  If `cam0_mapping` visibly dewarps the wrong camera's raw image
   (garbled/black output), switch it to `"frame_major"`
   (`[cam0_A, cam1_A, cam0_B, cam1_B]`). Only relevant in `"set"` mode, or
   in `"loose"` mode when the two cameras are combined into one file.
+- **`piv_settings.search_size_iters` is a best-effort translation, not a
+  verified value.** `piv_gpu`'s real signature takes it as a tuple, one
+  entry per multi-pass resolution level (length = number of passes; each
+  entry = deformation iterations at that pass's window size) -- `[1, 1, 1]`
+  is a guess at reproducing the pipeline's original 3-pass intent. Confirm
+  the exact semantics against `openpiv-python-gpu`'s own docs if precise
+  convergence behavior matters for your data.
 
 ## What it does
 
@@ -121,24 +128,37 @@ the compiler requirement above comes from CUDA Toolkit's own installer.
 
    Alternatively, set `PYTHONPATH` in your shell before running the script.
 
+## Configuration file
+
+All pipeline settings live in a JSON file -- `stereo_piv_config.json` next
+to `Stereo-PIV.py` by default, or pass a different path as the first
+argument: `python Stereo-PIV.py my_config.json`. On first run, if that
+file doesn't exist, the script writes one out populated with its built-in
+defaults and proceeds using them -- so it works out of the box, and after
+that you just edit the JSON and re-run; no need to touch the `.py` file
+for day-to-day tuning. You only need to include the keys you're actually
+changing in the file -- anything you leave out falls back to the default.
+
 ## Usage
 
-1. Fill in `CAM0_MAPPING` / `CAM1_MAPPING` at the top of `Stereo-PIV.py`
-   with both cameras' real DaVis calibration report coefficients (`x0`,
-   `x_span`, `y0`, `y_span`, `dx_coefs`, `dy_coefs`).
-2. Set the stereo geometry angles (`alpha1_deg`/`alpha2_deg`,
+1. Run `python Stereo-PIV.py` once to generate `stereo_piv_config.json`
+   with default values.
+2. Fill in `cam0_mapping` / `cam1_mapping` in that file with both cameras'
+   real DaVis calibration report coefficients (`x0`, `x_span`, `y0`,
+   `y_span`, `dx_coefs`, `dy_coefs`).
+3. Set the stereo geometry angles (`alpha1_deg`/`alpha2_deg`,
    `beta1_deg`/`beta2_deg`) per the warning above.
-3. Set `input_mode`/`input_path` to point at your stereo set (or loose
+4. Set `input_mode`/`input_path` to point at your stereo set (or loose
    folder), and confirm `stereo_frame_order` (or `suffix_cam0`/
    `suffix_cam1` in loose mode) matches how your data actually separates
    the two cameras (see warning above).
-4. Edit the rest of `CONTROLS`, then run:
+5. Edit the rest of the config file, then run:
 
    ```bash
    python Stereo-PIV.py
    ```
 
-### Key settings (`CONTROLS`)
+### Key settings (`stereo_piv_config.json`)
 
 | Setting | Description |
 |---|---|
@@ -148,11 +168,12 @@ the compiler requirement above comes from CUDA Toolkit's own installer.
 | `stereo_frame_order` | How a combined buffer/file's 4 frames are ordered: `"camera_major"` (`[cam0_A, cam0_B, cam1_A, cam1_B]`, default) or `"frame_major"` (`[cam0_A, cam1_A, cam0_B, cam1_B]`) |
 | `suffix_cam0` / `suffix_cam1` | (`"loose"` mode only) filename suffixes used to pair each camera's double-frame file when the two cameras aren't combined into one file |
 | `loose_glob` | (`"loose"` mode only) glob pattern used to find files in `input_path` |
-| `cam0_mapping` / `cam1_mapping` | `CameraMapping` instances holding each camera's DaVis calibration polynomial |
+| `cam0_mapping` / `cam1_mapping` | Objects holding each camera's DaVis calibration polynomial coefficients (`x0`, `x_span`, `y0`, `y_span`, `dx_coefs`, `dy_coefs`, `name`) |
 | `world_shape` | Shape of the shared dewarped output grid, from DaVis's "Size of dewarped image" |
 | `world_scale_px_per_mm` | World-grid scale factor, from DaVis's calibration report |
 | `dewarp_order` | Interpolation order for the dewarp (1 = bilinear) |
-| `piv_kwargs` | Forwarded to `piv_gpu(frame_shape, **piv_kwargs)` -- window size, iterations, overlap, `dt`, validation method, etc. |
+| `min_search_size` | Interrogation window size in px (required by `piv_gpu`, multiples of 8/powers of 2 only) |
+| `piv_settings` | Forwarded to `piv_gpu(frame_shape, min_search_size, **piv_settings)` -- `search_size_iters`, `overlap_ratio`, `dt`, and any other `piv_gpu` kwarg. Unrecognized keys are warned about (typo check), not silently dropped. |
 | `global_outlier_std` | Reject vectors more than N standard deviations from the mean (`None` disables) |
 | `replace_invalid` | Interpolate over invalid/NaN vectors, per camera, before combining |
 | `smooth_field` / `smooth_sigma` | Gaussian-smooth each camera's field before combining |
