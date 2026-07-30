@@ -65,6 +65,24 @@ camera per run, not once per frame. If it's still a bottleneck for a large
 dataset, swap `from scipy.ndimage import map_coordinates` for
 `from cupyx.scipy.ndimage import map_coordinates` (CuPy is already a
 dependency via piv_gpu) to run the warp on the GPU as well.
+
+GPU MEMORY NOTE
+----------------
+Each camera's piv_gpu instance is built, run, and torn down (see
+run_camera()) rather than both cameras' instances being created once and
+held for the whole run -- only one camera's correlation buffers are
+resident on the GPU at a time, which roughly halves peak VRAM. This costs
+some speed, since FFT plans are rebuilt for every camera on every pair
+instead of being reused across the run. On a memory-constrained GPU (a
+few GB VRAM, especially if it's also driving a display or shared with
+DaVis) this tradeoff is worth it; if VRAM isn't tight, build process0/
+process1 once in main() (as the planar pipeline does with a single
+process) and reuse them pair to pair instead. The other big lever if
+VRAM is still too tight is CONTROLS.piv_kwargs itself: raising
+min_search_size and/or lowering overlap_ratio shrinks the number of
+simultaneous correlation windows (at the cost of vector spatial
+resolution), which usually matters far more than the sequential-camera
+change above.
 """
 
 import os
@@ -500,14 +518,31 @@ def init_processor(frame_shape, ctrl):
     return process, x, y
 
 
-def handle_pair(process0, process1, pair_id, dw_a0, dw_b0, dw_a1, dw_b1,
-                 x, y, ctrl, angles):
+def run_camera(frame_a, frame_b, ctrl):
+    """Build a fresh piv_gpu instance for ONE camera's dewarped pair, run
+    it, then free its GPU memory before returning. This keeps only one
+    camera's correlation buffers resident on the GPU at a time instead of
+    holding both cameras' piv_gpu instances simultaneously -- roughly
+    halves peak VRAM, at the cost of rebuilding FFT plans for every
+    camera, every pair (no plan reuse across the run). Worth it on a
+    memory-constrained GPU; if VRAM isn't the bottleneck, hoist
+    init_processor() calls back out to main() and reuse the same process0/
+    process1 across all pairs instead."""
+    process, x, y = init_processor(frame_a.shape, ctrl)
+    u, v, valid, elapsed = process_camera(process, frame_a, frame_b, ctrl)
+    del process
+    cp.get_default_memory_pool().free_all_blocks()
+    cp.get_default_pinned_memory_pool().free_all_blocks()
+    return u, v, valid, elapsed, x, y
+
+
+def handle_pair(pair_id, dw_a0, dw_b0, dw_a1, dw_b1, ctrl, angles):
     if ctrl.verbose:
         print(f"Processing {pair_id} ...", end=" ", flush=True)
 
     alpha1, alpha2, beta1, beta2 = angles
-    u1, v1, valid1, elapsed1 = process_camera(process0, dw_a0, dw_b0, ctrl)
-    u2, v2, valid2, elapsed2 = process_camera(process1, dw_a1, dw_b1, ctrl)
+    u1, v1, valid1, elapsed1, x, y = run_camera(dw_a0, dw_b0, ctrl)
+    u2, v2, valid2, elapsed2, _, _ = run_camera(dw_a1, dw_b1, ctrl)
     valid = valid1 & valid2
     elapsed = elapsed1 + elapsed2
 
@@ -558,8 +593,6 @@ def main():
     angles = (np.deg2rad(ctrl.alpha1_deg), np.deg2rad(ctrl.alpha2_deg),
               np.deg2rad(ctrl.beta1_deg), np.deg2rad(ctrl.beta2_deg))
 
-    process0 = process1 = None
-    x = y = None
     summary_rows = []
 
     for pair_id, fa0, fb0, fa1, fb1 in pair_source:
@@ -569,13 +602,11 @@ def main():
         dw_a1 = ctrl.cam1_mapping.dewarp_image(fa1, ctrl.world_shape, ctrl.dewarp_order)
         dw_b1 = ctrl.cam1_mapping.dewarp_image(fb1, ctrl.world_shape, ctrl.dewarp_order)
 
-        if process0 is None:
-            process0, x, y = init_processor(dw_a0.shape, ctrl)
-            process1, _, _ = init_processor(dw_a1.shape, ctrl)
-
-        summary_rows.append(handle_pair(process0, process1, pair_id,
-                                          dw_a0, dw_b0, dw_a1, dw_b1,
-                                          x, y, ctrl, angles))
+        # each camera's piv_gpu instance is built and torn down inside
+        # handle_pair()/run_camera() -- see run_camera()'s docstring for
+        # why (peak VRAM vs. speed tradeoff)
+        summary_rows.append(handle_pair(pair_id, dw_a0, dw_b0, dw_a1, dw_b1,
+                                          ctrl, angles))
 
     if not summary_rows:
         sys.exit("No stereo pairs were processed -- check input_mode/input_path")
