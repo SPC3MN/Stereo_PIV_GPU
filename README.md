@@ -29,18 +29,24 @@ displacement fields into 3-component (U, V, W) stereo velocity.
   `alpha1_deg`/`alpha2_deg` only flips the sign of the reconstructed W --
   if W comes out inverted relative to a known reference (mean flow
   direction, or DaVis's own W sign convention), swap them.
-- **`stereo_frame_order` is an assumption, not a verified fact.** A stereo
-  buffer's 4 frames (2 cameras x 2 frames) are read in `"camera_major"`
-  order (`[cam0_A, cam0_B, cam1_A, cam1_B]`) by default. If `CAM0_MAPPING`
-  visibly dewarps the wrong camera's raw image (garbled/black output),
-  switch it to `"frame_major"` (`[cam0_A, cam1_A, cam0_B, cam1_B]`).
+- **`stereo_frame_order` is an assumption, not a verified fact.** A combined
+  stereo buffer's 4 frames (2 cameras x 2 frames) are read in
+  `"camera_major"` order (`[cam0_A, cam0_B, cam1_A, cam1_B]`) by default.
+  If `CAM0_MAPPING` visibly dewarps the wrong camera's raw image
+  (garbled/black output), switch it to `"frame_major"`
+  (`[cam0_A, cam1_A, cam0_B, cam1_B]`). Only relevant in `"set"` mode, or
+  in `"loose"` mode when the two cameras are combined into one file.
 
 ## What it does
 
-- Reads raw double-frame stereo buffers from a single DaVis set (DaVis
-  multi-set, plain folder of `.im7` files, or single buffer file --
-  auto-detected), splitting each buffer's 4 frames into each camera's
-  frame-A/frame-B pair
+- Reads raw stereo `.im7` images directly via `lvpyio` in one of two
+  `input_mode`s:
+  - `"set"` -- a DaVis image set (folder or `.set` file), iterated in
+    native LaVision-container order
+  - `"loose"` -- a plain folder of standalone `.im7` files, auto-detecting
+    whether each file already combines both cameras' 4 exposures, or each
+    camera's double-frame pair is a separate file matched by
+    `suffix_cam0`/`suffix_cam1`
 - Dewarps each camera's raw images onto a shared world grid using DaVis's
   own 3rd-order polynomial mapping (`CameraMapping`), caching the coordinate
   grid per camera so it's only computed once per run, not once per frame
@@ -122,9 +128,10 @@ the compiler requirement above comes from CUDA Toolkit's own installer.
    `x_span`, `y0`, `y_span`, `dx_coefs`, `dy_coefs`).
 2. Set the stereo geometry angles (`alpha1_deg`/`alpha2_deg`,
    `beta1_deg`/`beta2_deg`) per the warning above.
-3. Point `input_path` at your stereo set and confirm `stereo_frame_order`
-   matches how your set actually interleaves the two cameras (see warning
-   above).
+3. Set `input_mode`/`input_path` to point at your stereo set (or loose
+   folder), and confirm `stereo_frame_order` (or `suffix_cam0`/
+   `suffix_cam1` in loose mode) matches how your data actually separates
+   the two cameras (see warning above).
 4. Edit the rest of `CONTROLS`, then run:
 
    ```bash
@@ -135,9 +142,12 @@ the compiler requirement above comes from CUDA Toolkit's own installer.
 
 | Setting | Description |
 |---|---|
-| `input_path` | Raw (non-dewarped) stereo `.im7` source -- a single DaVis set, a plain folder, or a single buffer file, holding BOTH cameras per buffer |
-| `multiset_index` | Which sub-set to use when `input_path` is a DaVis multi-set |
-| `stereo_frame_order` | How the 4 frames in each buffer are ordered: `"camera_major"` (`[cam0_A, cam0_B, cam1_A, cam1_B]`, default) or `"frame_major"` (`[cam0_A, cam1_A, cam0_B, cam1_B]`) |
+| `input_mode` | `"set"` (DaVis image set) or `"loose"` (plain folder of `.im7` files) |
+| `input_path` | Raw (non-dewarped) stereo `.im7` source -- a `.set` file/set folder (`"set"` mode) or a plain folder (`"loose"` mode) |
+| `multiset_index` | Which sub-set to use when `input_path` is a DaVis multi-set (`"set"` mode) |
+| `stereo_frame_order` | How a combined buffer/file's 4 frames are ordered: `"camera_major"` (`[cam0_A, cam0_B, cam1_A, cam1_B]`, default) or `"frame_major"` (`[cam0_A, cam1_A, cam0_B, cam1_B]`) |
+| `suffix_cam0` / `suffix_cam1` | (`"loose"` mode only) filename suffixes used to pair each camera's double-frame file when the two cameras aren't combined into one file |
+| `loose_glob` | (`"loose"` mode only) glob pattern used to find files in `input_path` |
 | `cam0_mapping` / `cam1_mapping` | `CameraMapping` instances holding each camera's DaVis calibration polynomial |
 | `world_shape` | Shape of the shared dewarped output grid, from DaVis's "Size of dewarped image" |
 | `world_scale_px_per_mm` | World-grid scale factor, from DaVis's calibration report |
