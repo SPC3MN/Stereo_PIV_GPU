@@ -1,6 +1,8 @@
 # Stereo GPU-PIV Processing (raw im7 input, DaVis dewarping)
 
-Processes **raw (non-dewarped)** `.im7` PIV image pairs from two cameras,
+Processes **raw (non-dewarped)** stereo `.im7` buffers from a **single
+LaVision/DaVis set** (each buffer holds both cameras' synchronized
+double-frame images -- no separate per-camera folders to keep in sync),
 dewarps each camera's images onto a shared world grid using the exact
 3rd-order polynomial from DaVis's calibration report ("Mapping of world
 (x'/y') to raw coordinates (x/y)"), runs
@@ -27,11 +29,18 @@ displacement fields into 3-component (U, V, W) stereo velocity.
   `alpha1_deg`/`alpha2_deg` only flips the sign of the reconstructed W --
   if W comes out inverted relative to a known reference (mean flow
   direction, or DaVis's own W sign convention), swap them.
+- **`stereo_frame_order` is an assumption, not a verified fact.** A stereo
+  buffer's 4 frames (2 cameras x 2 frames) are read in `"camera_major"`
+  order (`[cam0_A, cam0_B, cam1_A, cam1_B]`) by default. If `CAM0_MAPPING`
+  visibly dewarps the wrong camera's raw image (garbled/black output),
+  switch it to `"frame_major"` (`[cam0_A, cam1_A, cam0_B, cam1_B]`).
 
 ## What it does
 
-- Reads raw `.im7` pairs per camera (DaVis set, folder, or single buffer --
-  auto-detected)
+- Reads raw double-frame stereo buffers from a single DaVis set (DaVis
+  multi-set, plain folder of `.im7` files, or single buffer file --
+  auto-detected), splitting each buffer's 4 frames into each camera's
+  frame-A/frame-B pair
 - Dewarps each camera's raw images onto a shared world grid using DaVis's
   own 3rd-order polynomial mapping (`CameraMapping`), caching the coordinate
   grid per camera so it's only computed once per run, not once per frame
@@ -113,7 +122,10 @@ the compiler requirement above comes from CUDA Toolkit's own installer.
    `x_span`, `y0`, `y_span`, `dx_coefs`, `dy_coefs`).
 2. Set the stereo geometry angles (`alpha1_deg`/`alpha2_deg`,
    `beta1_deg`/`beta2_deg`) per the warning above.
-3. Edit the rest of `CONTROLS`, then run:
+3. Point `input_path` at your stereo set and confirm `stereo_frame_order`
+   matches how your set actually interleaves the two cameras (see warning
+   above).
+4. Edit the rest of `CONTROLS`, then run:
 
    ```bash
    python Stereo-PIV.py
@@ -123,8 +135,9 @@ the compiler requirement above comes from CUDA Toolkit's own installer.
 
 | Setting | Description |
 |---|---|
-| `cam0_input_path` / `cam1_input_path` | Raw (non-dewarped) `.im7` source per camera -- a DaVis set, a plain folder, or a single buffer file |
-| `multiset_index` | Which sub-set to use when an input path is a DaVis multi-set |
+| `input_path` | Raw (non-dewarped) stereo `.im7` source -- a single DaVis set, a plain folder, or a single buffer file, holding BOTH cameras per buffer |
+| `multiset_index` | Which sub-set to use when `input_path` is a DaVis multi-set |
+| `stereo_frame_order` | How the 4 frames in each buffer are ordered: `"camera_major"` (`[cam0_A, cam0_B, cam1_A, cam1_B]`, default) or `"frame_major"` (`[cam0_A, cam1_A, cam0_B, cam1_B]`) |
 | `cam0_mapping` / `cam1_mapping` | `CameraMapping` instances holding each camera's DaVis calibration polynomial |
 | `world_shape` | Shape of the shared dewarped output grid, from DaVis's "Size of dewarped image" |
 | `world_scale_px_per_mm` | World-grid scale factor, from DaVis's calibration report |
