@@ -12,10 +12,9 @@ displacement fields into 3-component (U, V, W) stereo velocity.
 
 ## ⚠️ Before trusting any output
 
-- **`cam1_mapping` in the config file is a placeholder.** Only `cam0_mapping`
-  ("Plane 1") is built from real calibration report coefficients. Replace
-  `cam1_mapping` with camera 2's ("Plane 2") actual coefficients from the
-  same DaVis report panel before trusting any output.
+- **`cam0_mapping`/`cam1_mapping` in the config file are both real now**
+  (calibration time 260724_211326, plate 204-15-3). If you re-run DaVis's
+  calibration later, update both from the new report.
 - **`alpha1_deg`/`alpha2_deg` (and `beta1_deg`/`beta2_deg`) are placeholders
   too.** This single-Z-plane calibration doesn't carry Z sensitivity on its
   own -- it needs either (a) DaVis's reported per-camera viewing angle to

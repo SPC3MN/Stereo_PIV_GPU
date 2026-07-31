@@ -42,13 +42,11 @@ INPUT_MODE options (set in the config file):
 
 WHAT'S REAL VS. A PLACEHOLDER RIGHT NOW
 ----------------------------------------
-- cam0_mapping in the config file is built from your actual "Plane 1"
-  calibration report coefficients -- verified: world_to_raw() reproduces
-  the same numbers computed by hand from your screenshot.
-- cam1_mapping is a PLACEHOLDER (clearly marked in DEFAULT_CONFIG below)
-  so the pipeline is exercisable end-to-end. Replace it with camera 2's
-  ("Plane 2") actual coefficients from the same DaVis report panel, in
-  the config file, before trusting any output.
+- cam0_mapping and cam1_mapping in the config file are both built from
+  your actual DaVis calibration report coefficients now (calibration time
+  260724_211326, plate 204-15-3, "Plane 1"/"Plane 2") -- verified:
+  world_to_raw() reproduces the same numbers computed by hand from your
+  screenshots. If you re-run DaVis's calibration later, update both here.
 - alpha1_deg/alpha2_deg/beta1_deg/beta2_deg (used only in the final
   combination step) are also placeholders. This single-Z-plane
   calibration doesn't carry Z sensitivity on its own -- that has to come
@@ -215,29 +213,29 @@ DEFAULT_CONFIG = {
     "loose_glob": "*.im7",                   # glob used to find files in "loose" mode
 
     # ---------------- Calibration mappings ----------
-    # cam0_mapping: your actual "Plane 1" calibration report coefficients.
-    # cam1_mapping: PLACEHOLDER -- replace with camera 2's ("Plane 2")
-    # actual coefficients from the same DaVis report panel before trusting
-    # any output. Fields match CameraMapping.__init__ above exactly.
+    # Both real now -- from DaVis's calibration report, calibration time
+    # 260724_211326, plate 204-15-3, "Plane 1"/"Plane 2" (camera 1/camera
+    # 2 in DaVis's own 1-indexed naming -> cam0_mapping/cam1_mapping here).
+    # Fields match CameraMapping.__init__ above exactly.
     "cam0_mapping": {
         "x0": 2806.99, "x_span": 4096.00, "y0": 1387.18, "y_span": 3008.00,
-        "dx_coefs": {"1": 804.1028, "s": 628.9870, "s2": 84.0572, "s3": -5.4234,
-                     "t": 3.1818, "t2": -0.3017, "t3": 0.2112,
-                     "st": 0.6693, "s2t": -0.1956, "t2s": -0.4162},
-        "dy_coefs": {"1": 28.8679, "s": 3.4689, "s2": -0.0086, "s3": -0.0561,
-                     "t": -1.2230, "t2": 1.3855, "t3": -0.9813,
-                     "st": 89.0937, "s2t": -5.3036, "t2s": -0.2961},
-        "name": "cam0",
+        "dx_coefs": {"1": 882.1674, "s": 629.5431, "s2": -74.6835, "s3": -4.4885,
+                     "t": -0.6616, "t2": 0.2021, "t3": -0.0545,
+                     "st": -0.6915, "s2t": -0.0594, "t2s": -0.1322},
+        "dy_coefs": {"1": 19.4802, "s": 17.2524, "s2": 1.4413, "s3": -0.0423,
+                     "t": 65.1278, "t2": -0.3800, "t3": -0.5897,
+                     "st": -76.3895, "s2t": -3.7352, "t2s": -0.2700},
+        "name": "cam0 (Plane 1)",
     },
     "cam1_mapping": {
-        "x0": 2806.99, "x_span": 4096.00, "y0": 1387.18, "y_span": 3008.00,
-        "dx_coefs": {"1": -780.0, "s": -610.0, "s2": 80.0, "s3": 5.0,
-                     "t": -3.0, "t2": 0.3, "t3": -0.2,
-                     "st": -0.6, "s2t": 0.2, "t2s": 0.4},
-        "dy_coefs": {"1": 30.0, "s": -3.2, "s2": 0.01, "s3": 0.05,
-                     "t": 1.3, "t2": -1.4, "t3": 0.98,
-                     "st": -88.0, "s2t": 5.0, "t2s": 0.3},
-        "name": "cam1 (PLACEHOLDER -- not your real data)",
+        "x0": 2806.99, "x_span": 4119.58, "y0": 1387.18, "y_span": 3025.32,
+        "dx_coefs": {"1": 846.8601, "s": 633.6056, "s2": -75.5333, "s3": -4.8160,
+                     "t": -1.0925, "t2": -0.0019, "t3": 0.6212,
+                     "st": -0.6421, "s2t": -0.2899, "t2s": -0.6121},
+        "dy_coefs": {"1": 19.2035, "s": 16.9346, "s2": 0.6940, "s3": 0.3712,
+                     "t": 67.3521, "t2": -0.5134, "t3": -0.1081,
+                     "st": -76.9309, "s2t": -4.0639, "t2s": -0.3362},
+        "name": "cam1 (Plane 2)",
     },
 
     # World/dewarped output grid, from DaVis's calibration report
