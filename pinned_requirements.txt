@@ -1,0 +1,44 @@
+# Exact `pip freeze` from a Windows machine this pipeline is confirmed
+# working on (NVIDIA driver 582.78, CUDA Toolkit 13.3, Quadro K2200,
+# Python 3.11.9). Use this to replicate that exact environment on a new
+# machine instead of picking package versions from scratch:
+#
+#   pip install -r pinned_requirements.txt
+#
+# Notes:
+# - openpiv-python-gpu is NOT in this list -- it's not on PyPI, it's a
+#   source clone added to PYTHONPATH (see README "Installation").
+# - cuda-pathfinder (a cupy-cuda13x dependency) located this machine's
+#   CUDA libraries (cuBLAS, cuFFT, etc.) via its system-wide CUDA Toolkit
+#   install -- no separate nvidia-*-cu13 pip packages were needed here.
+#   If cuda-pathfinder can't find a system Toolkit on your machine, you
+#   may need to install one (matching your driver's supported CUDA
+#   version) or the equivalent nvidia-*-cu13 packages instead.
+# - Several packages here (opencv-python, scikit-image, imagecodecs, etc.)
+#   are pulled in by lvpyio/matplotlib's own dependency chains or by other
+#   work sharing this venv, not all directly required by Stereo-PIV.py.
+
+colorama==0.4.6
+contourpy==1.3.3
+cuda-pathfinder==1.6.0
+cupy-cuda13x==14.1.1
+cycler==0.12.1
+fonttools==4.63.0
+imagecodecs==2026.3.6
+ImageIO==2.37.4
+kiwisolver==1.5.0
+lazy-loader==0.5
+lvpyio==1.4.0
+matplotlib==3.11.1
+networkx==3.6.1
+numpy==2.4.6
+opencv-python==5.0.0.93
+packaging==26.2
+pillow==12.3.0
+pyparsing==3.3.2
+python-dateutil==2.9.0.post0
+scikit-image==0.26.0
+scipy==1.17.1
+six==1.17.0
+tifffile==2026.3.3
+tqdm==4.69.1

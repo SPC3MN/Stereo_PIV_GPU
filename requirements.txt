@@ -4,10 +4,16 @@ matplotlib
 scipy
 lvpyio
 
-# GPU array backend -- pick ONE based on your CUDA Toolkit version, then
-# uncomment it (or install manually, see README):
+# GPU array backend -- pick ONE based on your CUDA Toolkit / driver version,
+# then uncomment it (or install manually, see README):
 # cupy-cuda11x   # CUDA Toolkit 11.2 - 11.8
 # cupy-cuda12x   # CUDA Toolkit 12.x
+# cupy-cuda13x   # CUDA Toolkit 13.x (also installs cuda-pathfinder)
 
 # openpiv-python-gpu is NOT on PyPI and is not installed by this file.
 # Clone it and add it to your PYTHONPATH -- see README "Installation".
+
+# For an exact, known-good environment to replicate on a new machine
+# (instead of picking versions above from scratch), see
+# pinned_requirements.txt -- a full `pip freeze` from a machine this
+# pipeline is confirmed working on.
