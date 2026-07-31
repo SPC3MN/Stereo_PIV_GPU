@@ -4,3 +4,4 @@ __pycache__/
 stereo_piv_output/
 cam0_raw/
 cam1_raw/
+stereo_piv_config.json
