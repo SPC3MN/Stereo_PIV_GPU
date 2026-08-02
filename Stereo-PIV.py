@@ -217,10 +217,15 @@ DEFAULT_CONFIG = {
     # this tuple format -- confirm the exact per-element semantics against
     # openpiv_gpu's own PIVGPU docs/source if precise convergence behavior
     # matters for your data.
+    # Default schedule: one pass at 64px/50% overlap, then three passes at
+    # 32px/75% overlap (search_size_iters=[1, 3] means 1 iteration at the
+    # coarse 64px level, then 3 refinement iterations at the finest
+    # min_search_size=32px level -- window size doubles per level going up
+    # from min_search_size, see the note above).
     "min_search_size": 32,
     "piv_settings": {
-        "search_size_iters": [1, 1, 1],
-        "overlap_ratio": 0.5,
+        "search_size_iters": [1, 3],
+        "overlap_ratio": [0.5, 0.75],
         "dt": 1.0,
     },
 

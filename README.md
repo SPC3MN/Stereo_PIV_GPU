@@ -42,13 +42,18 @@ planar (non-stereo) counterpart, see
   (garbled/black output), switch it to `"frame_major"`
   (`[cam0_A, cam1_A, cam0_B, cam1_B]`). Only relevant in `"set"` mode, or
   in `"loose"` mode when the two cameras are combined into one file.
-- **`piv_settings.search_size_iters` is a best-effort translation, not a
-  verified value.** `piv_gpu`'s real signature takes it as a tuple, one
-  entry per multi-pass resolution level (length = number of passes; each
-  entry = deformation iterations at that pass's window size) -- `[1, 1, 1]`
-  is a guess at reproducing the pipeline's original 3-pass intent. Confirm
-  the exact semantics against `openpiv-python-gpu`'s own docs if precise
-  convergence behavior matters for your data.
+- **`piv_settings.search_size_iters`/`overlap_ratio` default to a 2-level
+  schedule, not a verified-for-your-data value.** `piv_gpu`'s real
+  signature takes `search_size_iters` as a tuple, one entry per multi-pass
+  resolution level (length = number of passes; each entry = deformation
+  iterations at that pass's window size; window size doubles per level
+  going up from `min_search_size`), and `overlap_ratio` as either a single
+  float or a matching per-level tuple. The default here --
+  `min_search_size=32`, `search_size_iters=[1, 3]`,
+  `overlap_ratio=[0.5, 0.75]` -- means one pass at 64px/50% overlap
+  followed by three refinement passes at 32px/75% overlap. Confirm this
+  schedule against `openpiv-python-gpu`'s own docs if precise convergence
+  behavior matters for your data.
 
 ## What it does
 
