@@ -8,7 +8,9 @@ camera's images onto a shared world grid using the exact 3rd-order
 polynomial from DaVis's calibration report ("Mapping of world (x'/y') to
 raw coordinates (x/y)"), runs openpiv_gpu's `piv_gpu` on each camera's
 dewarped pair, then combines the two in-plane displacement fields into
-3-component (U, V, W) velocity.
+3-component (U, V, W) velocity. For a no-GPU CPU fallback using plain
+openpiv-python, see CPU_Stereo_Processing.py instead -- it shares this
+file's calibration/dewarping/reconstruction code via stereo_common.py.
 
 Requires: pip install lvpyio   (LaVision's official reader, cross-platform,
 pure pip install -- no DaVis license or C++ build tools needed to read data)
@@ -27,18 +29,33 @@ you're actually changing -- anything missing from the file falls back to
 DEFAULT_CONFIG.
 
 INPUT_MODE options (set in the config file):
-  "set"   -- point at a DaVis stereo image set (a folder or a .set file,
-             still inside its original project structure). lvpyio iterates
-             the buffers directly in native LaVision-container order; each
-             buffer's 4 frames (2 cameras x 2 exposures) are split per
-             STEREO_FRAME_ORDER below -- no manual file pairing needed.
-             This is the fastest path if your im7s are still sitting where
-             DaVis wrote them.
+  "set"   -- point input_path at either:
+               - a single DaVis stereo image set (a .set path, or a plain
+                 folder lvpyio can read directly) -- processes just that
+                 one set.
+               - a folder that itself contains multiple *.set entries --
+                 every set inside is batch-processed in turn, each into
+                 its own subfolder of output_dir.
+             See piv_common.resolve_set_paths() for the exact detection
+             rule. lvpyio iterates the buffers directly in native
+             LaVision-container order; each buffer's 4 frames (2 cameras x
+             2 exposures) are split per STEREO_FRAME_ORDER below -- no
+             manual file pairing needed.
   "loose" -- a plain folder of standalone .im7 files, e.g. ones you've
              copied out of a project. Auto-detects whether each file
              already contains all 4 exposures (one combined file per
              stereo pair) or each camera's double-frame pair is a SEPARATE
-             file, matched by suffix_cam0/suffix_cam1.
+             file, matched by suffix_cam0/suffix_cam1. Always treated as a
+             single run (no folder-of-sets batching).
+
+SINGLE-SET PREVIEW
+-------------------
+When input_mode="set" and input_path points at exactly one set (not a
+folder of several), the FIRST pair's 3-component velocity field is
+computed, plotted, and opened for review before the rest of that set is
+processed -- see piv_common.preview_first_snapshot(). Declining at the
+prompt aborts the run. This step is skipped in folder-of-sets batch mode
+and in "loose" mode, so unattended batch runs aren't blocked on a prompt.
 
 WHAT'S REAL VS. A PLACEHOLDER RIGHT NOW
 ----------------------------------------
@@ -62,10 +79,10 @@ WHAT'S REAL VS. A PLACEHOLDER RIGHT NOW
   buffer/file -- "camera_major" ([cam0_A, cam0_B, cam1_A, cam1_B]) is the
   default guess. If cam0_mapping visibly dewarps the wrong camera's image
   (garbled/black output), flip it to "frame_major"
-  ([cam0_A, cam1_A, cam0_B, cam1_B]) -- see frames_from_stereo_buffer()
-  below. Only relevant when a single buffer/file actually holds all 4
-  exposures; the "loose" separate-file case sidesteps this entirely since
-  each camera's pair is its own file.
+  ([cam0_A, cam1_A, cam0_B, cam1_B]) -- see stereo_common.frames_from_stereo_buffer().
+  Only relevant when a single buffer/file actually holds all 4 exposures;
+  the "loose" separate-file case sidesteps this entirely since each
+  camera's pair is its own file.
 - piv_settings.search_size_iters (in the config file) is a best-effort
   translation of the pipeline's original multi-pass intent into the
   actual piv_gpu API's tuple-per-pass format -- see the PIV WINDOW
@@ -93,89 +110,24 @@ resident on the GPU at a time, which roughly halves peak VRAM. This costs
 some speed, since FFT plans are rebuilt for every camera on every pair
 instead of being reused across the run. On a memory-constrained GPU (a
 few GB VRAM, especially if it's also driving a display or shared with
-DaVis) this tradeoff is worth it; if VRAM isn't tight, build process0/
-process1 once in main() (as the planar pipeline does with a single
-process) and reuse them pair to pair instead. The other big lever if
-VRAM is still too tight is piv_settings in the config file: lowering
-overlap_ratio shrinks the number of simultaneous correlation windows (at
-the cost of vector spatial resolution) -- this matters far more than
-min_search_size does, since (for a fixed overlap_ratio) the correlation
-buffer memory is roughly invariant to window size: n_windows scales as
-1/step**2 while each window's padded FFT buffer scales as window_size**2,
-and step = window_size*(1-overlap_ratio), so those cancel except for the
+DaVis) this tradeoff is worth it. The other big lever if VRAM is still
+too tight is piv_settings in the config file: lowering overlap_ratio
+shrinks the number of simultaneous correlation windows (at the cost of
+vector spatial resolution) -- this matters far more than min_search_size
+does, since (for a fixed overlap_ratio) the correlation buffer memory is
+roughly invariant to window size: n_windows scales as 1/step**2 while
+each window's padded FFT buffer scales as window_size**2, and
+step = window_size*(1-overlap_ratio), so those cancel except for the
 overlap_ratio term.
 """
 
 import os
 import sys
-import json
-import glob
 import csv
-import time
 import numpy as np
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import cupy as cp
-from scipy.ndimage import map_coordinates
 
-import lvpyio as lv
-from openpiv_gpu.gpu_process import piv_gpu
-
-
-# ======================================================================
-# Camera calibration: DaVis's polynomial world<->raw mapping
-# ======================================================================
-class CameraMapping:
-    """
-    DaVis 3rd-order polynomial calibration, single Z plane:
-        s(x') = 2*(x' - x0) / x_span
-        t(y') = 2*(y' - y0) / y_span
-        x = x' - dx(s, t)
-        y = y' - dy(s, t)
-    dx_coefs / dy_coefs are dicts with keys
-    '1','s','s2','s3','t','t2','t3','st','s2t','t2s' -- read directly off
-    DaVis's calibration report panel, in order.
-    """
-    def __init__(self, x0, x_span, y0, y_span, dx_coefs, dy_coefs, name=""):
-        self.x0, self.x_span = x0, x_span
-        self.y0, self.y_span = y0, y_span
-        self.dx_coefs, self.dy_coefs = dx_coefs, dy_coefs
-        self.name = name
-        self._cached_shape = None
-        self._x_raw = self._y_raw = None
-
-    def s(self, xp):
-        return 2 * (xp - self.x0) / self.x_span
-
-    def t(self, yp):
-        return 2 * (yp - self.y0) / self.y_span
-
-    @staticmethod
-    def _poly(s, t, c):
-        return (c['1'] + c['s'] * s + c['s2'] * s**2 + c['s3'] * s**3
-                 + c['t'] * t + c['t2'] * t**2 + c['t3'] * t**3
-                 + c['st'] * s * t + c['s2t'] * s**2 * t + c['t2s'] * t**2 * s)
-
-    def world_to_raw(self, xp, yp):
-        s, t = self.s(xp), self.t(yp)
-        x = xp - self._poly(s, t, self.dx_coefs)
-        y = yp - self._poly(s, t, self.dy_coefs)
-        return x, y
-
-    def _ensure_grid(self, world_shape):
-        if self._cached_shape != world_shape:
-            ny, nx = world_shape
-            yp, xp = np.mgrid[0:ny, 0:nx].astype(np.float32)
-            self._x_raw, self._y_raw = self.world_to_raw(xp, yp)
-            self._cached_shape = world_shape
-
-    def dewarp_image(self, raw_image, world_shape, order=1):
-        """Backward-map raw_image onto a (world_shape) grid. Coordinate
-        grid is computed once per (camera, world_shape) and cached."""
-        self._ensure_grid(world_shape)
-        return map_coordinates(raw_image, [self._y_raw, self._x_raw],
-                                order=order, mode="constant", cval=0.0)
+import piv_common as pc
+import stereo_common as sc
 
 
 # ======================================================================
@@ -188,10 +140,10 @@ CONFIG_PATH = "stereo_piv_config.json"
 DEFAULT_CONFIG = {
     # ---------------- Input source ----------------
     "input_mode": "set",                     # "set" or "loose"
-    "input_path": "D:\\messy_data\\Stereo\\6-12_5.set",  # .set file / set folder / plain folder
+    "input_path": "D:\\messy_data\\Stereo\\6-12_5.set",  # .set file / set folder / plain folder / folder-of-sets
 
-    # Only used for input_mode == "set", if that path turns out to be a
-    # DaVis multi-set. Which sub-set to process; 0 is usually camera 1 --
+    # Only used for input_mode == "set", if a given set turns out to be a
+    # DaVis multiset. Which sub-set to process; 0 is usually camera 1 --
     # but for a proper stereo set both cameras live in the SAME sub-set's
     # buffers (see stereo_frame_order), so this is rarely needed here.
     "multiset_index": 0,
@@ -216,7 +168,7 @@ DEFAULT_CONFIG = {
     # Both real now -- from DaVis's calibration report, calibration time
     # 260724_211326, plate 204-15-3, "Plane 1"/"Plane 2" (camera 1/camera
     # 2 in DaVis's own 1-indexed naming -> cam0_mapping/cam1_mapping here).
-    # Fields match CameraMapping.__init__ above exactly.
+    # Fields match stereo_common.CameraMapping.__init__ above exactly.
     "cam0_mapping": {
         "x0": 2806.99, "x_span": 4096.00, "y0": 1387.18, "y_span": 3008.00,
         "dx_coefs": {"1": 882.1674, "s": 629.5431, "s2": -74.6835, "s3": -4.4885,
@@ -253,7 +205,8 @@ DEFAULT_CONFIG = {
     # arg, not part of piv_settings/**kwargs). piv_settings is forwarded
     # as piv_gpu(frame_shape, min_search_size, **piv_settings);
     # unrecognized keys are only WARNED about, never dropped -- see
-    # check_piv_settings() (piv_gpu itself ignores unknown kwargs safely).
+    # piv_common.check_piv_settings() (piv_gpu itself ignores unknown
+    # kwargs safely).
     #
     # search_size_iters is a TUPLE, one entry per multi-pass resolution
     # level -- its length sets the number of passes (window size doubles
@@ -318,287 +271,19 @@ class CONTROLS:
     pass
 
 
+def _fixup_stereo_controls(config, ctrl):
+    ctrl.world_shape = tuple(ctrl.world_shape)
+    ctrl.cam0_mapping = sc.CameraMapping(**config["cam0_mapping"])
+    ctrl.cam1_mapping = sc.CameraMapping(**config["cam1_mapping"])
+
+
 def load_controls(config_path):
-    """Load pipeline settings from a JSON config file, creating one
-    (populated with DEFAULT_CONFIG) if it doesn't exist yet, then apply
-    the merged result onto CONTROLS. Keys present in the file override
-    DEFAULT_CONFIG's; anything the file doesn't mention falls back to the
-    default -- you only need to include the settings you're changing."""
-    config = dict(DEFAULT_CONFIG)
-    if os.path.exists(config_path):
-        with open(config_path) as f:
-            user_config = json.load(f)
-        config.update(user_config)
-        print(f"[info] loaded config from '{config_path}'")
-    else:
-        with open(config_path, "w") as f:
-            json.dump(DEFAULT_CONFIG, f, indent=2)
-        print(f"[info] '{config_path}' didn't exist -- wrote defaults there. "
-              "Edit it (calibration coefficients, input_path, etc.) and "
-              "re-run to customize.")
-
-    for key, val in config.items():
-        setattr(CONTROLS, key, val)
-
-    CONTROLS.world_shape = tuple(CONTROLS.world_shape)
-    CONTROLS.cam0_mapping = CameraMapping(**config["cam0_mapping"])
-    CONTROLS.cam1_mapping = CameraMapping(**config["cam1_mapping"])
-    return CONTROLS
+    return pc.load_controls(config_path, DEFAULT_CONFIG, CONTROLS, on_loaded=_fixup_stereo_controls)
 
 
 # ======================================================================
-# im7 -> numpy frame extraction
+# Per-camera / per-pair processing
 # ======================================================================
-def frames_from_buffer(buf):
-    """Pull raw intensity arrays for frame A and frame B out of a single
-    camera's double-frame Buffer."""
-    if len(buf.frames) < 2:
-        raise ValueError(
-            f"expected a double-frame buffer (2 frames), got {len(buf.frames)}"
-        )
-    frame_a = buf.frames[0].images[0]
-    frame_b = buf.frames[1].images[0]
-    return frame_a, frame_b
-
-
-def frames_from_stereo_buffer(buf, frame_order):
-    """Pull raw intensity arrays for BOTH cameras' frame A/B out of a
-    combined stereo Buffer's 4 frames (2 cameras x 2 exposures).
-
-    lvpyio doesn't label which frame belongs to which camera -- the ORDER
-    is an assumption (see STEREO_FRAME_ORDER in the module docstring).
-    Confirm it against your own set before trusting output; flip
-    stereo_frame_order in CONTROLS if the wrong pair of frames ends up
-    dewarped by each camera's mapping."""
-    if len(buf.frames) != 4:
-        raise ValueError(
-            f"expected a 4-frame stereo buffer (2 cameras x 2 frames), got "
-            f"{len(buf.frames)} -- if your cameras are stored as SEPARATE "
-            "double-frame files, use input_mode='loose' with "
-            "suffix_cam0/suffix_cam1 set correctly"
-        )
-    f0, f1, f2, f3 = (f.images[0] for f in buf.frames)
-    if frame_order == "camera_major":     # [cam0_A, cam0_B, cam1_A, cam1_B]
-        return f0, f1, f2, f3
-    elif frame_order == "frame_major":    # [cam0_A, cam1_A, cam0_B, cam1_B]
-        return f0, f2, f1, f3
-    raise ValueError(f"unknown stereo_frame_order {frame_order!r}")
-
-
-def iter_stereo_from_set(ctrl):
-    """Yield (pair_id, fa0, fb0, fa1, fb1) from a DaVis stereo image set."""
-    if lv.is_multiset(ctrl.input_path):
-        print(f"[info] '{ctrl.input_path}' is a multi-set -- using sub-set "
-              f"index {ctrl.multiset_index}")
-        sets = lv.read_set(ctrl.input_path)
-        dataset = sets[ctrl.multiset_index]
-        owns_dataset = False
-    else:
-        dataset = lv.read_set(ctrl.input_path)
-        owns_dataset = True
-
-    try:
-        n = len(dataset)
-        for i in range(n):
-            pair_id = f"{i:04d}"
-            buf = dataset[i]
-            fa0, fb0, fa1, fb1 = frames_from_stereo_buffer(buf, ctrl.stereo_frame_order)
-            yield pair_id, fa0, fb0, fa1, fb1
-    finally:
-        if owns_dataset:
-            dataset.close()
-
-
-def iter_stereo_from_loose_files(ctrl):
-    """Yield (pair_id, fa0, fb0, fa1, fb1) from a plain folder of .im7
-    files -- either one combined 4-frame file per stereo pair, or each
-    camera's double-frame pair as a separate file (auto-detected)."""
-    paths = sorted(glob.glob(os.path.join(ctrl.input_path, ctrl.loose_glob)))
-    if not paths:
-        sys.exit(f"No files matching '{ctrl.loose_glob}' in '{ctrl.input_path}'")
-
-    first_buf = lv.read_buffer(paths[0])
-    combined = len(first_buf.frames) >= 4
-
-    if combined:
-        for path in paths:
-            pair_id = os.path.splitext(os.path.basename(path))[0]
-            buf = lv.read_buffer(path)
-            fa0, fb0, fa1, fb1 = frames_from_stereo_buffer(buf, ctrl.stereo_frame_order)
-            yield pair_id, fa0, fb0, fa1, fb1
-    else:
-        # each camera's double-frame pair is a SEPARATE file, matched by suffix
-        files0 = sorted(p for p in paths if p.endswith(ctrl.suffix_cam0))
-        if not files0:
-            sys.exit(
-                f"Files aren't combined 4-frame stereo buffers but none end "
-                f"in '{ctrl.suffix_cam0}' -- set suffix_cam0/suffix_cam1 in "
-                "the config file to match your naming"
-            )
-        for path0 in files0:
-            path1 = path0[: -len(ctrl.suffix_cam0)] + ctrl.suffix_cam1
-            if not os.path.exists(path1):
-                print(f"[warn] no match for {os.path.basename(path0)} "
-                      f"(expected {os.path.basename(path1)}) -- skipping")
-                continue
-            pair_id = os.path.basename(path0)[: -len(ctrl.suffix_cam0)]
-            fa0, fb0 = frames_from_buffer(lv.read_buffer(path0))
-            fa1, fb1 = frames_from_buffer(lv.read_buffer(path1))
-            yield pair_id, fa0, fb0, fa1, fb1
-
-
-# ======================================================================
-# Shared PIV / post-processing helpers (same logic as the planar pipeline)
-# ======================================================================
-# The real keyword names piv_gpu.__init__(frame_shape, min_search_size,
-# **kwargs) accepts -- min_search_size itself is a separate required
-# positional arg, NOT one of these. piv_gpu already ignores unrecognized
-# kwargs safely (each one is read via `kwargs["x"] if "x" in kwargs else
-# DEFAULT`, never strict signature binding), so this set exists only to
-# WARN about likely typos in piv_settings, not to filter/drop anything --
-# unlike the old inspect.signature-based approach, which was actively
-# wrong here (it matched against **kwargs's own parameter name, not the
-# individual setting names it swallows, so it dropped everything real).
-PIV_GPU_SETTINGS_KEYS = frozenset({
-    "search_size_iters", "overlap_ratio", "shrink_ratio", "center",
-    "normalize", "mask_zero", "subpixel_method", "n_fft", "deforming_par",
-    "batch_size", "s2n_method", "s2n_size", "validation_size", "s2n_tol",
-    "median_tol", "mad_tol", "mean_tol", "rms_tol", "num_replacing_iters",
-    "replacing_method", "replacing_size", "revalidate", "smooth",
-    "smoothing_par", "dt", "scaling_par", "mask", "dtype_f",
-})
-
-
-def check_piv_settings(piv_settings):
-    unknown = sorted(set(piv_settings) - PIV_GPU_SETTINGS_KEYS)
-    if unknown:
-        print(f"[warn] piv_settings has keys piv_gpu won't recognize: "
-              f"{unknown} -- check spelling against piv_gpu's __init__ "
-              "kwargs (they're silently ignored, not an error)")
-
-
-def global_outlier_mask(u, v, n_std):
-    if n_std is None:
-        return np.zeros_like(u, dtype=bool)
-    u_mean, u_std = np.nanmean(u), np.nanstd(u)
-    v_mean, v_std = np.nanmean(v), np.nanstd(v)
-    return (np.abs(u - u_mean) > n_std * u_std) | (np.abs(v - v_mean) > n_std * v_std)
-
-
-def replace_invalid_vectors(x, y, u, v, valid_mask):
-    from scipy.interpolate import griddata
-    invalid = ~valid_mask
-    if not invalid.any():
-        return u, v
-    pts_valid = np.column_stack([x[valid_mask], y[valid_mask]])
-    u_out, v_out = u.copy(), v.copy()
-    u_out[invalid] = griddata(pts_valid, u[valid_mask], (x[invalid], y[invalid]), method="linear")
-    v_out[invalid] = griddata(pts_valid, v[valid_mask], (x[invalid], y[invalid]), method="linear")
-    still_bad = np.isnan(u_out)
-    if still_bad.any():
-        u_out[still_bad] = griddata(pts_valid, u[valid_mask], (x[still_bad], y[still_bad]), method="nearest")
-        v_out[still_bad] = griddata(pts_valid, v[valid_mask], (x[still_bad], y[still_bad]), method="nearest")
-    return u_out, v_out
-
-
-def smooth_vector_field(u, v, sigma):
-    from scipy.ndimage import gaussian_filter
-    mask = (~np.isnan(u)).astype(float)
-    u0, v0 = np.nan_to_num(u), np.nan_to_num(v)
-    wsum = np.clip(gaussian_filter(mask, sigma), 1e-8, None)
-    return gaussian_filter(u0, sigma) / wsum, gaussian_filter(v0, sigma) / wsum
-
-
-def reconstruct_stereo(dx1, dy1, dx2, dy2, alpha1, alpha2, beta1, beta2):
-    """Combine two cameras' in-plane displacement fields (on a common
-    dewarped grid) into 3-component displacement (dX, dY, dZ) by solving,
-    in a least-squares sense:
-        dx1 = dX          - dZ*tan(alpha1)
-        dx2 = dX          - dZ*tan(alpha2)
-        dy1 =       dY    - dZ*tan(beta1)
-        dy2 =       dY    - dZ*tan(beta2)
-    This handles degenerate cases automatically -- e.g. beta1 == beta2, as
-    in a rig where the two cameras are tilted apart in only one plane (no
-    relative vertical tilt): the y-pair becomes redundant rather than a
-    divide-by-zero, and dZ is correctly identified from the x-pair alone.
-    Verified against synthetic ground truth for the general case, this
-    degenerate case, and per-point angle-map inputs (angles may be scalars
-    or arrays matching dx1's shape)."""
-    ta1, ta2 = np.tan(alpha1), np.tan(alpha2)
-    tb1, tb2 = np.tan(beta1), np.tan(beta2)
-    shape = np.broadcast(dx1, ta1, ta2, tb1, tb2).shape
-    ta1b, ta2b, tb1b, tb2b = (np.broadcast_to(np.asarray(a, dtype=float), shape)
-                               for a in (ta1, ta2, tb1, tb2))
-    zeros, ones = np.zeros(shape), np.ones(shape)
-    A = np.stack([
-        np.stack([ones,  zeros, -ta1b], axis=-1),
-        np.stack([ones,  zeros, -ta2b], axis=-1),
-        np.stack([zeros, ones,  -tb1b], axis=-1),
-        np.stack([zeros, ones,  -tb2b], axis=-1),
-    ], axis=-2)  # (..., 4, 3)
-    b = np.stack(np.broadcast_arrays(dx1, dx2, dy1, dy2), axis=-1)  # (..., 4)
-    AtA = np.einsum('...ki,...kj->...ij', A, A)   # (..., 3, 3)
-    Atb = np.einsum('...ki,...k->...i', A, b)     # (..., 3)
-    sol = np.linalg.solve(AtA, Atb[..., None])[..., 0]  # (..., 3)
-    return sol[..., 0], sol[..., 1], sol[..., 2]
-
-
-def plot_and_save(x, y, U, V, W, valid, out_path, ctrl, title):
-    fig, ax = plt.subplots(figsize=(8, 6))
-    sc = ax.quiver(x[valid], y[valid], U[valid], V[valid], W[valid],
-                    cmap="coolwarm", scale=ctrl.quiver_scale)
-    fig.colorbar(sc, ax=ax, label="W (out-of-plane)")
-    ax.set_title(title)
-    ax.set_xlabel("x (world px)")
-    ax.set_ylabel("y (world px)")
-    ax.invert_yaxis()
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=ctrl.plot_dpi)
-    if ctrl.show_plots:
-        plt.show()
-    plt.close(fig)
-
-
-def process_camera(process, frame_a, frame_b, ctrl):
-    """Run piv_gpu on one camera's already-dewarped pair and apply
-    per-camera post-processing. Returns (u, v, valid, elapsed) in world
-    px/frame."""
-    t0 = time.time()
-    u, v = process(frame_a, frame_b)
-    free, total = cp.cuda.runtime.memGetInfo()
-    if ctrl.verbose:
-        print(f"GPU free: {free / 1024 ** 3:.2f} GB / {total / 1024 ** 3:.2f} GB")
-    elapsed = time.time() - t0
-
-    if ctrl.apply_v_sign_flip:
-        v = -v
-
-    valid = ~process.val_locations
-    if ctrl.global_outlier_std is not None:
-        valid = valid & ~global_outlier_mask(u, v, ctrl.global_outlier_std)
-
-    u_out, v_out = u.copy(), v.copy()
-    u_out[~valid] = np.nan
-    v_out[~valid] = np.nan
-
-    if ctrl.replace_invalid:
-        x, y = process.coords
-        u_out, v_out = replace_invalid_vectors(x, y, u_out, v_out, valid)
-
-    if ctrl.smooth_field:
-        u_out, v_out = smooth_vector_field(u_out, v_out, ctrl.smooth_sigma)
-
-    return u_out, v_out, valid, elapsed
-
-
-def init_processor(frame_shape, ctrl):
-    check_piv_settings(ctrl.piv_settings)
-    process = piv_gpu(frame_shape, ctrl.min_search_size, **ctrl.piv_settings)
-    x, y = process.coords
-    y = frame_shape[0] * process.scaling_par - y
-    return process, x, y
-
-
 def run_camera(frame_a, frame_b, ctrl):
     """Build a fresh piv_gpu instance for ONE camera's dewarped pair, run
     it, then free its GPU memory before returning. This keeps only one
@@ -606,18 +291,17 @@ def run_camera(frame_a, frame_b, ctrl):
     holding both cameras' piv_gpu instances simultaneously -- roughly
     halves peak VRAM, at the cost of rebuilding FFT plans for every
     camera, every pair (no plan reuse across the run). Worth it on a
-    memory-constrained GPU; if VRAM isn't the bottleneck, hoist
-    init_processor() calls back out to main() and reuse the same process0/
-    process1 across all pairs instead."""
-    process, x, y = init_processor(frame_a.shape, ctrl)
-    u, v, valid, elapsed = process_camera(process, frame_a, frame_b, ctrl)
+    memory-constrained GPU; if VRAM isn't the bottleneck, hoist the
+    init_gpu_processor() calls back out to main() and reuse the same
+    process0/process1 across all pairs instead."""
+    process, x, y = pc.init_gpu_processor(frame_a.shape, ctrl.min_search_size, ctrl.piv_settings)
+    u, v, valid, elapsed = pc.process_frames(process, frame_a, frame_b, ctrl, report_gpu_mem=True)
     del process
-    cp.get_default_memory_pool().free_all_blocks()
-    cp.get_default_pinned_memory_pool().free_all_blocks()
+    pc.free_gpu_pools()
     return u, v, valid, elapsed, x, y
 
 
-def handle_pair(pair_id, dw_a0, dw_b0, dw_a1, dw_b1, ctrl, angles):
+def handle_pair(pair_id, dw_a0, dw_b0, dw_a1, dw_b1, ctrl, angles, output_dir):
     if ctrl.verbose:
         print(f"Processing {pair_id} ...", end=" ", flush=True)
 
@@ -631,8 +315,8 @@ def handle_pair(pair_id, dw_a0, dw_b0, dw_a1, dw_b1, ctrl, angles):
     u1_mm, v1_mm, u2_mm, v2_mm = (a / ctrl.world_scale_px_per_mm
                                    for a in (u1, v1, u2, v2))
 
-    U, V, W = reconstruct_stereo(u1_mm, v1_mm, u2_mm, v2_mm,
-                                  alpha1, alpha2, beta1, beta2)
+    U, V, W = sc.reconstruct_stereo(u1_mm, v1_mm, u2_mm, v2_mm,
+                                     alpha1, alpha2, beta1, beta2)
 
     if ctrl.frame_dt_s is not None:
         U, V, W = (a / ctrl.frame_dt_s for a in (U, V, W))
@@ -646,15 +330,54 @@ def handle_pair(pair_id, dw_a0, dw_b0, dw_a1, dw_b1, ctrl, angles):
         print(f"{elapsed:.3f} s, {n_valid}/{n_total} valid vectors")
 
     if ctrl.save_npz:
-        np.savez(os.path.join(ctrl.output_dir, f"{pair_id}_stereo_velocity.npz"),
+        np.savez(os.path.join(output_dir, f"{pair_id}_stereo_velocity.npz"),
                  x=x, y=y, U=U, V=V, W=W, valid=valid)
 
     if ctrl.save_plot:
-        plot_and_save(x, y, U, V, W, valid,
-                      os.path.join(ctrl.output_dir, f"{pair_id}_stereo_quiver.png"),
-                      ctrl, title=f"Stereo PIV -- {pair_id}")
+        sc.plot_and_save_stereo(x, y, U, V, W, valid,
+                                 os.path.join(output_dir, f"{pair_id}_stereo_quiver.png"),
+                                 ctrl, title=f"Stereo PIV -- {pair_id}")
 
-    return (pair_id, elapsed, n_valid, n_total)
+    row = (pair_id, elapsed, n_valid, n_total)
+    return row, x, y, U, V, W, valid
+
+
+def process_pairs(pair_source, ctrl, angles, output_dir, interactive_preview):
+    summary_rows = []
+    for idx, (pair_id, fa0, fb0, fa1, fb1) in enumerate(pair_source):
+        # dewarp both frames of both cameras onto the shared world grid
+        dw_a0 = ctrl.cam0_mapping.dewarp_image(fa0, ctrl.world_shape, ctrl.dewarp_order)
+        dw_b0 = ctrl.cam0_mapping.dewarp_image(fb0, ctrl.world_shape, ctrl.dewarp_order)
+        dw_a1 = ctrl.cam1_mapping.dewarp_image(fa1, ctrl.world_shape, ctrl.dewarp_order)
+        dw_b1 = ctrl.cam1_mapping.dewarp_image(fb1, ctrl.world_shape, ctrl.dewarp_order)
+
+        row, x, y, U, V, W, valid = handle_pair(pair_id, dw_a0, dw_b0, dw_a1, dw_b1,
+                                                  ctrl, angles, output_dir)
+        summary_rows.append(row)
+
+        if idx == 0 and interactive_preview:
+            preview_path = os.path.join(output_dir, f"{pair_id}_first_snapshot_preview.png")
+            sc.plot_and_save_stereo(x, y, U, V, W, valid, preview_path, ctrl,
+                                     title=f"First snapshot preview -- {pair_id}")
+            pc.preview_first_snapshot(preview_path)
+
+    return summary_rows
+
+
+def write_summary(summary_rows, output_dir, ctrl):
+    if not summary_rows:
+        return
+    if ctrl.save_summary_csv:
+        csv_path = os.path.join(output_dir, "stereo_processing_summary.csv")
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["pair_id", "process_time_s", "n_valid", "n_total"])
+            writer.writerows(summary_rows)
+        print(f"Summary written to {csv_path}")
+
+    total_time = sum(row[1] for row in summary_rows)
+    print(f"Done: {len(summary_rows)} pair(s) in {total_time:.3f} s "
+          f"({total_time / len(summary_rows):.3f} s/pair average)")
 
 
 # ======================================================================
@@ -666,44 +389,42 @@ def main():
     os.makedirs(ctrl.output_dir, exist_ok=True)
 
     if ctrl.input_mode == "set":
-        pair_source = iter_stereo_from_set(ctrl)
+        set_paths, is_batch = pc.resolve_set_paths(ctrl.input_path)
     elif ctrl.input_mode == "loose":
-        pair_source = iter_stereo_from_loose_files(ctrl)
+        set_paths, is_batch = [ctrl.input_path], False
     else:
         sys.exit(f"Unknown input_mode: {ctrl.input_mode!r} (use 'set' or 'loose')")
+
+    if is_batch:
+        print(f"[info] '{ctrl.input_path}' contains {len(set_paths)} set(s) -- "
+              "batch-processing each (no first-snapshot preview in this mode)")
 
     angles = (np.deg2rad(ctrl.alpha1_deg), np.deg2rad(ctrl.alpha2_deg),
               np.deg2rad(ctrl.beta1_deg), np.deg2rad(ctrl.beta2_deg))
 
-    summary_rows = []
+    grand_summary = []
+    for set_path in set_paths:
+        output_dir = (os.path.join(ctrl.output_dir, pc.set_label(set_path))
+                       if is_batch else ctrl.output_dir)
+        os.makedirs(output_dir, exist_ok=True)
 
-    for pair_id, fa0, fb0, fa1, fb1 in pair_source:
-        # dewarp both frames of both cameras onto the shared world grid
-        dw_a0 = ctrl.cam0_mapping.dewarp_image(fa0, ctrl.world_shape, ctrl.dewarp_order)
-        dw_b0 = ctrl.cam0_mapping.dewarp_image(fb0, ctrl.world_shape, ctrl.dewarp_order)
-        dw_a1 = ctrl.cam1_mapping.dewarp_image(fa1, ctrl.world_shape, ctrl.dewarp_order)
-        dw_b1 = ctrl.cam1_mapping.dewarp_image(fb1, ctrl.world_shape, ctrl.dewarp_order)
+        if ctrl.input_mode == "set":
+            print(f"[info] processing set '{set_path}'")
+            pair_source = sc.iter_stereo_from_set(ctrl, set_path)
+        else:
+            pair_source = sc.iter_stereo_from_loose_files(ctrl)
 
-        # each camera's piv_gpu instance is built and torn down inside
-        # handle_pair()/run_camera() -- see run_camera()'s docstring for
-        # why (peak VRAM vs. speed tradeoff)
-        summary_rows.append(handle_pair(pair_id, dw_a0, dw_b0, dw_a1, dw_b1,
-                                          ctrl, angles))
+        summary_rows = process_pairs(pair_source, ctrl, angles, output_dir,
+                                      interactive_preview=not is_batch)
+        if not summary_rows:
+            print(f"[warn] no stereo pairs were processed for '{set_path}'")
+            continue
 
-    if not summary_rows:
+        write_summary(summary_rows, output_dir, ctrl)
+        grand_summary.extend(summary_rows)
+
+    if not grand_summary:
         sys.exit("No stereo pairs were processed -- check input_mode/input_path")
-
-    if ctrl.save_summary_csv:
-        csv_path = os.path.join(ctrl.output_dir, "stereo_processing_summary.csv")
-        with open(csv_path, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["pair_id", "process_time_s", "n_valid", "n_total"])
-            writer.writerows(summary_rows)
-        print(f"Summary written to {csv_path}")
-
-    total_time = sum(row[1] for row in summary_rows)
-    print(f"Done: {len(summary_rows)} pair(s) in {total_time:.3f} s "
-          f"({total_time / len(summary_rows):.3f} s/pair average)")
 
 
 if __name__ == "__main__":

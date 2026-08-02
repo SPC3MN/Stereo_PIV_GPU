@@ -1,7 +1,7 @@
 # Stereo GPU-PIV Processing (raw im7 input, DaVis dewarping)
 
-Processes **raw (non-dewarped)** stereo `.im7` buffers from a **single
-LaVision/DaVis set** (each buffer holds both cameras' synchronized
+Processes **raw (non-dewarped)** stereo `.im7` buffers from one or more
+LaVision/DaVis sets (each buffer holds both cameras' synchronized
 double-frame images -- no separate per-camera folders to keep in sync),
 dewarps each camera's images onto a shared world grid using the exact
 3rd-order polynomial from DaVis's calibration report ("Mapping of world
@@ -9,6 +9,13 @@ dewarps each camera's images onto a shared world grid using the exact
 [`openpiv-python-gpu`](https://github.com/ali-sh-96/openpiv-python-gpu)'s
 `piv_gpu` on each camera's dewarped pair, then combines the two in-plane
 displacement fields into 3-component (U, V, W) stereo velocity.
+
+For a CPU-only build of this same pipeline (no GPU/CUDA required, using
+plain [`openpiv-python`](https://github.com/OpenPIV/openpiv-python)
+instead of `piv_gpu`), see
+[`Stereo_PIV_CPU`](https://github.com/SPC3MN/Stereo_PIV_CPU). For the
+planar (non-stereo) counterpart, see
+[`Planar_PIV_GPU`](https://github.com/SPC3MN/Planar_PIV_GPU).
 
 ## ⚠️ Before trusting any output
 
@@ -47,12 +54,21 @@ displacement fields into 3-component (U, V, W) stereo velocity.
 
 - Reads raw stereo `.im7` images directly via `lvpyio` in one of two
   `input_mode`s:
-  - `"set"` -- a DaVis image set (folder or `.set` file), iterated in
-    native LaVision-container order
+  - `"set"` -- point `input_path` at either a **single** DaVis image set
+    (folder or `.set` file, iterated in native LaVision-container order),
+    or a **folder containing several `*.set` entries**, in which case
+    every set inside is batch-processed in turn into its own subfolder of
+    `output_dir` (see `piv_common.resolve_set_paths()`)
   - `"loose"` -- a plain folder of standalone `.im7` files, auto-detecting
     whether each file already combines both cameras' 4 exposures, or each
     camera's double-frame pair is a separate file matched by
     `suffix_cam0`/`suffix_cam1`
+- **Single-set preview:** when `input_path` resolves to exactly one set
+  (not a folder of several), the first pair's 3-component velocity field
+  is computed, plotted, and opened for review -- the run pauses on a
+  terminal `y/N` prompt before processing the rest of that set. Skipped
+  entirely in folder-of-sets batch mode and in `"loose"` mode, so
+  unattended batch runs never block on a prompt.
 - Dewarps each camera's raw images onto a shared world grid using DaVis's
   own 3rd-order polynomial mapping (`CameraMapping`), caching the coordinate
   grid per camera so it's only computed once per run, not once per frame
@@ -65,6 +81,14 @@ displacement fields into 3-component (U, V, W) stereo velocity.
   where both cameras share the same y-tilt (`beta1 == beta2`)
 - Saves results per pair as `.npz` (and optionally a stereo quiver plot
   colored by W), plus an optional CSV summary across the batch
+
+## Files
+
+| File | Purpose |
+|---|---|
+| `Stereo-PIV.py` | Entry point -- run this |
+| `piv_common.py` | Shared config loading, post-processing, GPU/CPU PIV engine adapters, plain im7 frame iteration, set-folder resolution, preview/confirm prompt |
+| `stereo_common.py` | Stereo-specific helpers -- `CameraMapping`/dewarping, stereo frame extraction, `reconstruct_stereo`, stereo quiver plot |
 
 ## Requirements
 
@@ -147,23 +171,29 @@ changing in the file -- anything you leave out falls back to the default.
    `y_span`, `dx_coefs`, `dy_coefs`).
 3. Set the stereo geometry angles (`alpha1_deg`/`alpha2_deg`,
    `beta1_deg`/`beta2_deg`) per the warning above.
-4. Set `input_mode`/`input_path` to point at your stereo set (or loose
-   folder), and confirm `stereo_frame_order` (or `suffix_cam0`/
-   `suffix_cam1` in loose mode) matches how your data actually separates
-   the two cameras (see warning above).
+4. Set `input_mode`/`input_path` to point at your stereo set, a folder of
+   several stereo sets, or a loose folder, and confirm `stereo_frame_order`
+   (or `suffix_cam0`/`suffix_cam1` in loose mode) matches how your data
+   actually separates the two cameras (see warning above).
 5. Edit the rest of the config file, then run:
 
    ```bash
    python Stereo-PIV.py
    ```
 
+   If `input_path` points at a single set, you'll be shown the first
+   pair's velocity field and asked to confirm before the rest of the set
+   is processed. If it points at a folder containing multiple `*.set`
+   entries, every set inside is processed automatically, one after
+   another, with no prompt.
+
 ### Key settings (`stereo_piv_config.json`)
 
 | Setting | Description |
 |---|---|
-| `input_mode` | `"set"` (DaVis image set) or `"loose"` (plain folder of `.im7` files) |
-| `input_path` | Raw (non-dewarped) stereo `.im7` source -- a `.set` file/set folder (`"set"` mode) or a plain folder (`"loose"` mode) |
-| `multiset_index` | Which sub-set to use when `input_path` is a DaVis multi-set (`"set"` mode) |
+| `input_mode` | `"set"` (DaVis image set(s)) or `"loose"` (plain folder of `.im7` files) |
+| `input_path` | Raw (non-dewarped) stereo `.im7` source -- a single `.set` file/set folder, a folder containing multiple `*.set` entries (batch-processed one after another), or a plain folder (`"loose"` mode) |
+| `multiset_index` | Which sub-set to use when a given set turns out to be a DaVis multi-set (`"set"` mode) |
 | `stereo_frame_order` | How a combined buffer/file's 4 frames are ordered: `"camera_major"` (`[cam0_A, cam0_B, cam1_A, cam1_B]`, default) or `"frame_major"` (`[cam0_A, cam1_A, cam0_B, cam1_B]`) |
 | `suffix_cam0` / `suffix_cam1` | (`"loose"` mode only) filename suffixes used to pair each camera's double-frame file when the two cameras aren't combined into one file |
 | `loose_glob` | (`"loose"` mode only) glob pattern used to find files in `input_path` |
@@ -183,10 +213,12 @@ changing in the file -- anything you leave out falls back to the default.
 
 ## Output
 
-For each image pair `<pair_id>`, in `output_dir`:
+For each image pair `<pair_id>`, in `output_dir` (or `output_dir/<set_name>`
+in folder-of-sets batch mode):
 
 - `<pair_id>_stereo_velocity.npz` -- contains `x`, `y`, `U`, `V`, `W`, `valid` arrays
 - `<pair_id>_stereo_quiver.png` -- quiver plot colored by `W` (if `save_plot = True`)
+- `<first_pair_id>_first_snapshot_preview.png` -- the preview plot shown before confirmation (single-set mode only)
 
 For the whole batch:
 
