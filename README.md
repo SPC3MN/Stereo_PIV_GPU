@@ -210,7 +210,8 @@ changing in the file -- anything you leave out falls back to the default.
 | `piv_settings` | Forwarded to `piv_gpu(frame_shape, min_search_size, **piv_settings)` -- `search_size_iters`, `overlap_ratio`, `dt`, and any other `piv_gpu` kwarg. Unrecognized keys are warned about (typo check), not silently dropped. |
 | `global_outlier_std` | Reject vectors more than N standard deviations from the mean (`None` disables) |
 | `replace_invalid` | Interpolate over invalid/NaN vectors, per camera, before combining |
-| `smooth_field` / `smooth_sigma` | Gaussian-smooth each camera's field before combining |
+| `smooth_field` / `smooth_sigma` | Gaussian-smooth each camera's field before combining -- ignored (with a warning) when `tiling.enabled` is true, see Tiling below |
+| `tiling` | `enabled`/`n_tiles_y`/`n_tiles_x`/`margin_px` -- split each camera's frame into tiles to bound peak VRAM on large frames/high overlap. See Tiling below |
 | `alpha1_deg` / `alpha2_deg` / `beta1_deg` / `beta2_deg` | Stereo viewing angles used in the U/V/W reconstruction -- see warning above |
 | `frame_dt_s` | s between frames; `None` keeps displacement units instead of velocity |
 | `apply_v_sign_flip` | Flip the sign of each camera's `v` before combining |
@@ -228,6 +229,44 @@ in folder-of-sets batch mode):
 For the whole batch:
 
 - `stereo_processing_summary.csv` -- `pair_id, process_time_s, n_valid, n_total` (if `save_summary_csv = True`)
+
+## Tiling (large frames / limited VRAM)
+
+`world_shape` here is often much larger than a raw camera frame (the
+dewarped output grid, e.g. 3067x5874px), and dense interrogation settings
+(small `min_search_size`, high `overlap_ratio`, multiple
+`search_size_iters`) can need several GB of VRAM for a SINGLE camera's
+correlation -- more than smaller/older GPUs have. When `tiling.enabled`
+is `true`, each camera's dewarped frame is instead split into an
+`n_tiles_y` x `n_tiles_x` grid of tiles, each padded with a `margin_px`
+halo (real image context around the tile so windows near its edge still
+have a full search area) and run through its own `piv_gpu` instance --
+built, run, and freed before the next tile -- so peak VRAM is bounded by
+ONE tile's window count instead of the whole frame's. Both cameras use
+identical tile geometry, so their results stay point-for-point aligned
+for `reconstruct_stereo()` -- no special handling needed there.
+
+`margin_px: null` picks a safe default automatically (the coarsest
+pass's window extent). Start with a modest tile count and increase it if
+you still hit `cupy.cuda.memory.OutOfMemoryError` -- peak memory doesn't
+scale down linearly with tile count (there's a meaningful fixed cost per
+`piv_gpu` call), so don't assume, say, 4x4 tiles will leave 16x headroom;
+verify empirically. Concretely, on a 4GB card processing a 3067x5874
+frame at `min_search_size=32`, `overlap_ratio=0.75`,
+`search_size_iters=3` (a config too dense to run untiled at all on that
+card): 4x4 tiles still peaked at ~2.9-3.0GB per tile (too close to the
+edge), 6x6 tiles peaked at ~1.3GB (comfortable), and 8x8 at ~0.8GB. That
+6x6 case took ~55s for one camera (vs. a couple seconds for the
+low-overlap non-tiled baseline) -- tiling trades speed for fitting in
+memory at all, it doesn't make a dense config fast.
+
+**Tiled output is a flat, unstructured point set** (1-D `x`/`y`/`u`/`v`/
+`valid` arrays), not a `(ny, nx)` grid like non-tiled output -- each
+tile's local window grid starts fresh at its own origin, so neighboring
+tiles' kept vectors don't generally land on one shared lattice. Quiver
+plotting and `replace_invalid`'s `griddata`-based interpolation both work
+fine on flat arrays; `smooth_field`'s Gaussian filter does not (it needs
+a regular grid), so it's skipped, with a warning, whenever tiling is on.
 
 ## Performance note
 

@@ -235,6 +235,33 @@ DEFAULT_CONFIG = {
     "smooth_field": False,
     "smooth_sigma": 1.0,
 
+    # ---------------- Tiling (large frames / limited VRAM) --------------
+    # When enabled, EACH CAMERA's dewarped frame pair is split into an
+    # n_tiles_y x n_tiles_x grid of halo-padded tiles, each run through
+    # its OWN piv_gpu instance (built, run, and freed before the next
+    # tile) instead of one piv_gpu call on the whole (often very large --
+    # world_shape above, not the raw camera resolution) dewarped frame --
+    # peak VRAM is then bounded by one tile's window count, not the whole
+    # frame's. Both cameras use the identical tile geometry (same
+    # world_shape, same tiling settings), so their combined per-tile
+    # results stay aligned point-for-point for reconstruct_stereo() --
+    # no different handling needed there. Only worth turning on if the
+    # full dewarped frame is too large to fit in VRAM at your desired
+    # min_search_size/overlap_ratio; leave n_tiles at 1x1 (equivalent to
+    # disabled) otherwise. margin_px null picks a safe default
+    # automatically -- see piv_common.default_tile_margin().
+    #
+    # NOTE: tiled output is a flat/unstructured point set, not a
+    # (ny, nx) grid -- and smooth_field above is skipped (with a warning)
+    # for tiled output, since Gaussian smoothing needs a regular grid.
+    # See piv_common.compute_tiles()'s module-level comment for why.
+    "tiling": {
+        "enabled": False,
+        "n_tiles_y": 1,
+        "n_tiles_x": 1,
+        "margin_px": None,
+    },
+
     # ---------------- Stereo geometry ----------------
     # Rig: each camera tilted 45 deg from the calibration plate normal,
     # 90 deg apart from each other -- a symmetric, single-plane-tilt
@@ -298,7 +325,24 @@ def run_camera(frame_a, frame_b, ctrl):
     camera, every pair (no plan reuse across the run). Worth it on a
     memory-constrained GPU; if VRAM isn't the bottleneck, hoist the
     init_gpu_processor() calls back out to main() and reuse the same
-    process0/process1 across all pairs instead."""
+    process0/process1 across all pairs instead.
+
+    If ctrl.tiling is enabled, this camera's dewarped frame is instead
+    processed tile by tile (piv_common.process_frames_tiled()) -- same
+    per-camera memory-bounding idea, just applied at a finer grain, for
+    cases where even ONE camera's full dewarped frame doesn't fit in
+    VRAM at the desired window/overlap settings."""
+    tiling = ctrl.tiling
+    if tiling["enabled"]:
+        margin = tiling["margin_px"] or pc.default_tile_margin(ctrl.min_search_size, ctrl.piv_settings)
+        init_raw_fn = lambda shape: pc._init_gpu_processor_raw(shape, ctrl.min_search_size, ctrl.piv_settings)
+        x, y, u, v, valid, elapsed = pc.process_frames_tiled(
+            frame_a, frame_b, ctrl, init_raw_fn,
+            tiling["n_tiles_y"], tiling["n_tiles_x"], margin,
+            report_gpu_mem=True, free_pools_fn=pc.free_gpu_pools,
+        )
+        return u, v, valid, elapsed, x, y
+
     process, x, y = pc.init_gpu_processor(frame_a.shape, ctrl.min_search_size, ctrl.piv_settings)
     u, v, valid, elapsed = pc.process_frames(process, frame_a, frame_b, ctrl, report_gpu_mem=True)
     del process
