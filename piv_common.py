@@ -174,6 +174,11 @@ def check_piv_settings(piv_settings):
 def init_gpu_processor(frame_shape, min_search_size, piv_settings):
     from openpiv_gpu.gpu_process import piv_gpu
     check_piv_settings(piv_settings)
+    # piv_gpu asserts isinstance(..., tuple) on sequence-valued settings
+    # (search_size_iters, overlap_ratio, ...) -- JSON only has lists, so
+    # anything loaded from the config file needs converting back to a
+    # tuple, or piv_gpu rejects it even though the values are correct.
+    piv_settings = {k: (tuple(v) if isinstance(v, list) else v) for k, v in piv_settings.items()}
     process = piv_gpu(frame_shape, min_search_size, **piv_settings)
     x, y = process.coords
     y = frame_shape[0] * process.scaling_par - y
